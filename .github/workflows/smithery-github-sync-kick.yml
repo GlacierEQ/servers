@@ -1,0 +1,84 @@
+name: Smithery GitHub Sync Kick
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '27 */6 * * *'
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/smithery-github-sync-kick.yml
+      - scripts/smithery-github-sync-kick.mjs
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+
+concurrency:
+  group: smithery-github-sync-kick
+  cancel-in-progress: false
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out trigger client
+        uses: actions/checkout@v4
+
+      - name: Trigger through Smithery-managed GitHub
+        id: smithery
+        continue-on-error: true
+        env:
+          SMITHERY_API_KEY: ${{ secrets.SMITHERY_API_KEY }}
+          SMITHERY_NAMESPACE: ${{ vars.SMITHERY_NAMESPACE || 'GlacierEQ' }}
+          TARGET_OWNER: GlacierEQ
+          TARGET_REPO: servers
+          TARGET_WORKFLOW: upstream-core-sync.yml
+          TARGET_REF: main
+        run: node scripts/smithery-github-sync-kick.mjs | tee /tmp/smithery-sync-receipt.json
+
+      - name: Fallback to repository-scoped GitHub token
+        id: fallback
+        if: steps.smithery.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run upstream-core-sync.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f upstream_ref=main
+
+      - name: Verify a trigger route completed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SMITHERY_OUTCOME: ${{ steps.smithery.outcome }}
+          FALLBACK_OUTCOME: ${{ steps.fallback.outcome }}
+        run: |
+          set -euo pipefail
+          echo "Smithery outcome: ${SMITHERY_OUTCOME}" >> "$GITHUB_STEP_SUMMARY"
+          echo "GitHub fallback outcome: ${FALLBACK_OUTCOME}" >> "$GITHUB_STEP_SUMMARY"
+          sleep 5
+          gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow upstream-core-sync.yml \
+            --limit 5 \
+            --json databaseId,event,status,conclusion,headSha,createdAt,url \
+            | tee /tmp/upstream-sync-runs.json
+          count="$(jq 'length' /tmp/upstream-sync-runs.json)"
+          if [[ "$count" -lt 1 ]]; then
+            echo 'No upstream-core-sync run was observable after either trigger route.' >&2
+            exit 1
+          fi
+
+      - name: Upload sanitized trigger receipts
+        uses: actions/upload-artifact@v4
+        with:
+          name: smithery-github-sync-kick-${{ github.run_id }}
+          path: |
+            /tmp/smithery-sync-receipt.json
+            /tmp/upstream-sync-runs.json
+          if-no-files-found: ignore
+          retention-days: 14
