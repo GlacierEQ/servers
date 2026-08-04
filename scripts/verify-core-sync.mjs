@@ -41,7 +41,7 @@ try {
 
 const files = walk(root);
 const textExtensions = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.json', '.md', '.py', '.toml', '.yaml', '.yml', '.sh']);
-const conflictPattern = /^(<{7}|={7}|>{7})(?:\s|$)/m;
+const conflictPattern = /^(<{7}|>{7})(?:\s|$)/m;
 const conflictFiles = [];
 const oversized = [];
 
