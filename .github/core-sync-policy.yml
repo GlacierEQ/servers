@@ -1,5 +1,9 @@
 version: 1
 
+bootstrap:
+  requested_at: '2026-08-04T08:33:00Z'
+  source: chatgpt_execution_first
+
 upstream:
   repository: modelcontextprotocol/servers
   ref: main
