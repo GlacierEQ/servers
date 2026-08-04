@@ -8,10 +8,10 @@ on:
     branches: [main]
     paths:
       - .github/workflows/smithery-github-sync-kick.yml
-      - scripts/smithery-github-sync-kick.mjs
       - .github/SMITHERY_SETUP.md
 
 permissions:
+  id-token: write
   actions: write
   contents: read
 
@@ -25,28 +25,37 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Check out trigger client
-        uses: actions/checkout@v4
-
-      - name: Install official Smithery CLI
-        run: npm install --global smithery@latest
-
-      - name: Trigger through Smithery-managed GitHub
-        id: smithery
+      - name: Trigger through unified credential broker
+        id: broker
         continue-on-error: true
         env:
-          SMITHERY_API_KEY: ${{ secrets.SMITHERY_API_KEY }}
-          SMITHERY_NAMESPACE: ${{ vars.SMITHERY_NAMESPACE || 'GlacierEQ' }}
-          SMITHERY_GITHUB_CONNECTION_ID: ${{ vars.SMITHERY_GITHUB_CONNECTION_ID || 'github' }}
-          TARGET_OWNER: GlacierEQ
-          TARGET_REPO: servers
-          TARGET_WORKFLOW: upstream-core-sync.yml
-          TARGET_REF: main
-        run: node scripts/smithery-github-sync-kick.mjs | tee /tmp/smithery-sync-receipt.json
+          CREDENTIAL_BROKER_URL: ${{ vars.CREDENTIAL_BROKER_URL }}
+          OIDC_AUDIENCE: unified-credential-mcp
+        run: |
+          set -euo pipefail
+          if [[ -z "${CREDENTIAL_BROKER_URL:-}" ]]; then
+            echo 'CREDENTIAL_BROKER_URL repository variable is not configured.' >&2
+            exit 78
+          fi
+
+          separator='?'
+          if [[ "${ACTIONS_ID_TOKEN_REQUEST_URL}" == *'?'* ]]; then separator='&'; fi
+          oidc_response="$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}${separator}audience=${OIDC_AUDIENCE}")"
+          oidc_token="$(jq -er '.value' <<<"${oidc_response}")"
+
+          curl --fail --silent --show-error \
+            --request POST \
+            --url "${CREDENTIAL_BROKER_URL}" \
+            --header "Authorization: Bearer ${oidc_token}" \
+            --header 'Content-Type: application/json' \
+            --data '{}' \
+            | tee /tmp/credential-broker-sync-receipt.json
 
       - name: Fallback to repository-scoped GitHub token
         id: fallback
-        if: steps.smithery.outcome != 'success'
+        if: steps.broker.outcome != 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -58,12 +67,11 @@ jobs:
       - name: Verify a new upstream sync run exists
         env:
           GH_TOKEN: ${{ github.token }}
-          SMITHERY_OUTCOME: ${{ steps.smithery.outcome }}
+          BROKER_OUTCOME: ${{ steps.broker.outcome }}
           FALLBACK_OUTCOME: ${{ steps.fallback.outcome }}
-          STARTED_AT: ${{ github.event.repository.updated_at }}
         run: |
           set -euo pipefail
-          echo "Smithery outcome: ${SMITHERY_OUTCOME}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Credential broker outcome: ${BROKER_OUTCOME}" >> "$GITHUB_STEP_SUMMARY"
           echo "GitHub fallback outcome: ${FALLBACK_OUTCOME}" >> "$GITHUB_STEP_SUMMARY"
 
           found=0
@@ -91,9 +99,9 @@ jobs:
       - name: Upload sanitized trigger receipts
         uses: actions/upload-artifact@v4
         with:
-          name: smithery-github-sync-kick-${{ github.run_id }}
+          name: credential-broker-sync-kick-${{ github.run_id }}
           path: |
-            /tmp/smithery-sync-receipt.json
+            /tmp/credential-broker-sync-receipt.json
             /tmp/upstream-sync-runs.json
           if-no-files-found: ignore
           retention-days: 14
