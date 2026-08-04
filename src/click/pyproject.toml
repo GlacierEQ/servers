@@ -1,6 +1,6 @@
 [project]
 name = "mcp-server-click"
-version = "0.1.0"
+version = "2026.8.4"
 description = "A Model Context Protocol server that exposes the subcommands of a click application as MCP tools"
 readme = "README.md"
 requires-python = ">=3.10"
