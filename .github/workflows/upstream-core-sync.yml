@@ -1,0 +1,206 @@
+name: Upstream Core Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Upstream branch or ref to synchronize
+        required: false
+        default: main
+  schedule:
+    - cron: '17 */6 * * *'
+  push:
+    branches:
+      - main
+      - sync-core-bootstrap-20260803
+    paths:
+      - .github/workflows/upstream-core-sync.yml
+      - .github/core-sync-policy.yml
+      - scripts/verify-core-sync.mjs
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: upstream-core-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: modelcontextprotocol/servers
+  SYNC_BRANCH: automation/upstream-core-sync
+  CONFLICT_ISSUE_TITLE: Upstream core synchronization conflict
+  SOURCE_REF: ${{ github.event_name == 'push' && github.ref_name || 'main' }}
+
+jobs:
+  synchronize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out GlacierEQ source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          fetch-depth: 0
+
+      - name: Configure synchronization identity
+        run: |
+          git config user.name 'glaciereq-sync[bot]'
+          git config user.email 'glaciereq-sync[bot]@users.noreply.github.com'
+
+      - name: Fetch upstream core
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+        run: |
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --prune --no-tags upstream "${UPSTREAM_REF}"
+          git update-ref refs/remotes/upstream/core FETCH_HEAD
+
+      - name: Measure divergence
+        id: divergence
+        shell: bash
+        run: |
+          set -euo pipefail
+          local_sha="$(git rev-parse HEAD)"
+          upstream_sha="$(git rev-parse refs/remotes/upstream/core)"
+          merge_base="$(git merge-base HEAD refs/remotes/upstream/core)"
+          behind="$(git rev-list --count HEAD..refs/remotes/upstream/core)"
+          ahead="$(git rev-list --count refs/remotes/upstream/core..HEAD)"
+
+          {
+            echo "local_sha=${local_sha}"
+            echo "upstream_sha=${upstream_sha}"
+            echo "merge_base=${merge_base}"
+            echo "behind=${behind}"
+            echo "ahead=${ahead}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo '## Upstream core divergence'
+            echo
+            echo "- GlacierEQ source ref: \`${SOURCE_REF}\`"
+            echo "- GlacierEQ source SHA: \`${local_sha}\`"
+            echo "- Upstream core: \`${upstream_sha}\`"
+            echo "- Merge base: \`${merge_base}\`"
+            echo "- Upstream commits pending: **${behind}**"
+            echo "- GlacierEQ-local commits: **${ahead}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop when already synchronized
+        if: steps.divergence.outputs.behind == '0'
+        run: echo 'GlacierEQ/servers already contains the selected upstream core.'
+
+      - name: Merge upstream into isolated sync branch
+        if: steps.divergence.outputs.behind != '0'
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout -B "${SYNC_BRANCH}" "${SOURCE_REF}"
+          set +e
+          git merge --no-ff --no-edit refs/remotes/upstream/core
+          merge_status=$?
+          set -e
+
+          if [[ $merge_status -ne 0 ]]; then
+            conflict_files="$(git diff --name-only --diff-filter=U | sort)"
+            printf '%s\n' "$conflict_files" > /tmp/upstream-sync-conflicts.txt
+            git merge --abort
+            echo 'status=conflict' >> "$GITHUB_OUTPUT"
+          else
+            echo 'status=merged' >> "$GITHUB_OUTPUT"
+            git rev-parse HEAD > /tmp/upstream-sync-head.txt
+          fi
+
+      - name: Verify merged core before push
+        if: steps.merge.outputs.status == 'merged'
+        run: node scripts/verify-core-sync.mjs
+
+      - name: Push synchronized branch
+        if: steps.merge.outputs.status == 'merged'
+        run: git push --force-with-lease origin "HEAD:refs/heads/${SYNC_BRANCH}"
+
+      - name: Create or refresh synchronization pull request
+        if: steps.merge.outputs.status == 'merged'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOCAL_SHA: ${{ steps.divergence.outputs.local_sha }}
+          UPSTREAM_SHA: ${{ steps.divergence.outputs.upstream_sha }}
+          MERGE_BASE: ${{ steps.divergence.outputs.merge_base }}
+          BEHIND: ${{ steps.divergence.outputs.behind }}
+          AHEAD: ${{ steps.divergence.outputs.ahead }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          title='chore(sync): merge upstream modelcontextprotocol/servers'
+          body_file=/tmp/upstream-sync-pr.md
+          cat > "$body_file" <<EOF
+          ## Automated upstream-core synchronization
+
+          This pull request merges the official \`${UPSTREAM_REPOSITORY}\` core into \`GlacierEQ/servers\` without replacing GlacierEQ-local commits.
+
+          ### Receipt
+
+          - GlacierEQ source ref: \`${SOURCE_REF}\`
+          - GlacierEQ source: \`${LOCAL_SHA}\`
+          - Upstream head: \`${UPSTREAM_SHA}\`
+          - Merge base: \`${MERGE_BASE}\`
+          - Upstream commits incorporated: **${BEHIND}**
+          - GlacierEQ-local commits preserved: **${AHEAD}**
+          - Verification: \`node scripts/verify-core-sync.mjs\`
+          - Trigger run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          ### Merge policy
+
+          The workflow never force-pushes \`main\`, never resolves conflicts with \`ours\` or \`theirs\`, and never discards GlacierEQ-local history. Conflicts are routed to a durable issue instead of being guessed away.
+          EOF
+
+          pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$SYNC_BRANCH" --base main --state open --json number --jq '.[0].number // empty')"
+          if [[ -n "$pr_number" ]]; then
+            gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$body_file"
+          else
+            gh pr create --repo "$GITHUB_REPOSITORY" --head "$SYNC_BRANCH" --base main --title "$title" --body-file "$body_file"
+          fi
+
+      - name: Record conflict without mutating core
+        if: steps.merge.outputs.status == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOCAL_SHA: ${{ steps.divergence.outputs.local_sha }}
+          UPSTREAM_SHA: ${{ steps.divergence.outputs.upstream_sha }}
+          MERGE_BASE: ${{ steps.divergence.outputs.merge_base }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          body_file=/tmp/upstream-sync-conflict.md
+          conflicts="$(cat /tmp/upstream-sync-conflicts.txt)"
+          cat > "$body_file" <<EOF
+          ## Upstream core synchronization conflict
+
+          The scheduled synchronization stopped without changing \`main\` because upstream and GlacierEQ-local edits conflict.
+
+          - GlacierEQ source ref: \`${SOURCE_REF}\`
+          - GlacierEQ source: \`${LOCAL_SHA}\`
+          - Upstream head: \`${UPSTREAM_SHA}\`
+          - Merge base: \`${MERGE_BASE}\`
+          - Trigger run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          ### Conflicting paths
+
+          \`\`\`
+          ${conflicts}
+          \`\`\`
+
+          No automatic conflict preference was applied. The existing core remains intact.
+          EOF
+
+          issue_number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "${CONFLICT_ISSUE_TITLE} in:title" --json number,title --jq '.[] | select(.title == env.CONFLICT_ISSUE_TITLE) | .number' | head -n1)"
+          if [[ -n "$issue_number" ]]; then
+            gh issue comment "$issue_number" --repo "$GITHUB_REPOSITORY" --body-file "$body_file"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$CONFLICT_ISSUE_TITLE" --body-file "$body_file"
+          fi
+          exit 1

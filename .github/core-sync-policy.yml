@@ -1,0 +1,54 @@
+version: 1
+
+upstream:
+  repository: modelcontextprotocol/servers
+  ref: main
+  cadence: every_6_hours
+
+core_preservation:
+  force_push_main: false
+  automatic_conflict_resolution: false
+  preserve_local_commits: true
+  synchronization_branch: automation/upstream-core-sync
+  delivery: pull_request
+  merge_strategy: merge_commit
+
+verification:
+  required:
+    - no_unmerged_paths
+    - no_conflict_markers
+    - json_parse
+    - package_lock_alignment
+    - upstream_remote_recorded
+  optional_expansion_checks:
+    - npm_build
+    - python_tests
+    - container_builds
+
+updates:
+  dependabot:
+    cadence: weekly
+    grouping: ecosystem
+    open_pull_request_limit: 10
+  upstream_sync:
+    conflict_action: create_or_update_issue
+    no_change_action: receipt_only
+
+gardening:
+  cadence: weekly
+  report_path: .github/reports/core-gardening-latest.md
+  inspect:
+    - stale_branches
+    - open_sync_pr
+    - dependency_manifests
+    - workflow_inventory
+    - oversized_files
+    - duplicate_lockfiles
+    - TODO_and_FIXME_density
+    - local_only_paths
+  mutate_core: false
+
+expansion:
+  default_location: extensions/
+  rule: keep_experimental_or_GlacierEQ_specific_servers_outside_upstream_managed_core_when_practical
+  promotion_gate: tests_and_documented_ownership
