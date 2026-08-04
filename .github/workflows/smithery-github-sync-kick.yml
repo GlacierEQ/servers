@@ -9,11 +9,11 @@ on:
     paths:
       - .github/workflows/smithery-github-sync-kick.yml
       - scripts/smithery-github-sync-kick.mjs
+      - .github/SMITHERY_SETUP.md
 
 permissions:
   actions: write
   contents: read
-  issues: write
 
 concurrency:
   group: smithery-github-sync-kick
@@ -28,12 +28,16 @@ jobs:
       - name: Check out trigger client
         uses: actions/checkout@v4
 
+      - name: Install official Smithery CLI
+        run: npm install --global smithery@latest
+
       - name: Trigger through Smithery-managed GitHub
         id: smithery
         continue-on-error: true
         env:
           SMITHERY_API_KEY: ${{ secrets.SMITHERY_API_KEY }}
           SMITHERY_NAMESPACE: ${{ vars.SMITHERY_NAMESPACE || 'GlacierEQ' }}
+          SMITHERY_GITHUB_CONNECTION_ID: ${{ vars.SMITHERY_GITHUB_CONNECTION_ID || 'github' }}
           TARGET_OWNER: GlacierEQ
           TARGET_REPO: servers
           TARGET_WORKFLOW: upstream-core-sync.yml
@@ -51,24 +55,35 @@ jobs:
             --ref main \
             -f upstream_ref=main
 
-      - name: Verify a trigger route completed
+      - name: Verify a new upstream sync run exists
         env:
           GH_TOKEN: ${{ github.token }}
           SMITHERY_OUTCOME: ${{ steps.smithery.outcome }}
           FALLBACK_OUTCOME: ${{ steps.fallback.outcome }}
+          STARTED_AT: ${{ github.event.repository.updated_at }}
         run: |
           set -euo pipefail
           echo "Smithery outcome: ${SMITHERY_OUTCOME}" >> "$GITHUB_STEP_SUMMARY"
           echo "GitHub fallback outcome: ${FALLBACK_OUTCOME}" >> "$GITHUB_STEP_SUMMARY"
-          sleep 5
-          gh run list \
-            --repo "$GITHUB_REPOSITORY" \
-            --workflow upstream-core-sync.yml \
-            --limit 5 \
-            --json databaseId,event,status,conclusion,headSha,createdAt,url \
-            | tee /tmp/upstream-sync-runs.json
-          count="$(jq 'length' /tmp/upstream-sync-runs.json)"
-          if [[ "$count" -lt 1 ]]; then
+
+          found=0
+          for attempt in 1 2 3 4 5 6; do
+            gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow upstream-core-sync.yml \
+              --limit 10 \
+              --json databaseId,event,status,conclusion,headSha,createdAt,url \
+              | tee /tmp/upstream-sync-runs.json
+
+            count="$(jq 'length' /tmp/upstream-sync-runs.json)"
+            if [[ "$count" -ge 1 ]]; then
+              found=1
+              break
+            fi
+            sleep 10
+          done
+
+          if [[ "$found" -ne 1 ]]; then
             echo 'No upstream-core-sync run was observable after either trigger route.' >&2
             exit 1
           fi
