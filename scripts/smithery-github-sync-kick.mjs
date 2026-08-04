@@ -1,35 +1,15 @@
-const apiKey = process.env.SMITHERY_API_KEY;
+import { spawnSync } from 'node:child_process';
+
 const namespace = process.env.SMITHERY_NAMESPACE || 'GlacierEQ';
+const connectionId = process.env.SMITHERY_GITHUB_CONNECTION_ID || 'github';
 const owner = process.env.TARGET_OWNER || 'GlacierEQ';
 const repo = process.env.TARGET_REPO || 'servers';
 const workflow = process.env.TARGET_WORKFLOW || 'upstream-core-sync.yml';
 const ref = process.env.TARGET_REF || 'main';
 
-if (!apiKey) {
+if (!process.env.SMITHERY_API_KEY) {
   console.error('SMITHERY_API_KEY is not configured');
   process.exit(78);
-}
-
-const headers = {
-  authorization: `Bearer ${apiKey}`,
-  accept: 'application/json',
-  'content-type': 'application/json',
-  'user-agent': 'GlacierEQ-servers-smithery-sync/1.0',
-};
-
-async function request(url, init = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20_000);
-  try {
-    const response = await fetch(url, { ...init, headers: { ...headers, ...(init.headers || {}) }, signal: controller.signal });
-    const text = await response.text();
-    let body = null;
-    try { body = text ? JSON.parse(text) : null; } catch { body = { non_json: true, length: text.length }; }
-    if (!response.ok) throw new Error(`Smithery HTTP ${response.status}: ${JSON.stringify(redact(body))}`);
-    return body;
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 function redact(value) {
@@ -37,28 +17,49 @@ function redact(value) {
   if (!value || typeof value !== 'object') return value;
   return Object.fromEntries(Object.entries(value).map(([key, item]) => [
     key,
-    /token|secret|authorization|api.?key|credential|setupurl/i.test(key) ? '[REDACTED]' : redact(item),
+    /token|secret|authorization|api.?key|credential|setupurl/i.test(key)
+      ? '[REDACTED]'
+      : redact(item),
   ]));
 }
 
-function connectionList(payload) {
-  if (Array.isArray(payload)) return payload;
-  for (const key of ['connections', 'data', 'items', 'results']) {
-    if (Array.isArray(payload?.[key])) return payload[key];
+function run(args, { allowFailure = false } = {}) {
+  const result = spawnSync('smithery', args, {
+    encoding: 'utf8',
+    env: process.env,
+    timeout: 60_000,
+  });
+
+  const stdout = result.stdout?.trim() || '';
+  const stderr = result.stderr?.trim() || '';
+
+  if (result.error) throw result.error;
+  if (result.status !== 0 && !allowFailure) {
+    throw new Error(`smithery ${args.join(' ')} failed (${result.status}): ${stderr || stdout}`);
   }
-  return [];
+  return { status: result.status, stdout, stderr };
 }
 
-function connectionId(connection) {
-  return connection.connectionId || connection.id || connection.connection_id;
+function parseJson(text, label) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`${label} did not return JSON`);
+  }
 }
 
-function isGitHub(connection) {
-  return JSON.stringify(redact(connection)).toLowerCase().includes('github');
-}
+function collectTools(value, output = []) {
+  if (Array.isArray(value)) {
+    for (const item of value) collectTools(item, output);
+    return output;
+  }
+  if (!value || typeof value !== 'object') return output;
 
-function toolsFrom(payload) {
-  return payload?.result?.tools || payload?.tools || [];
+  if (typeof value.name === 'string' && (value.inputSchema || value.input_schema || value.description)) {
+    output.push(value);
+  }
+  for (const item of Object.values(value)) collectTools(item, output);
+  return output;
 }
 
 function buildArguments(schema = {}) {
@@ -68,6 +69,7 @@ function buildArguments(schema = {}) {
     const found = names.find((name) => Object.hasOwn(properties, name));
     if (found) args[found] = value;
   };
+
   assign(['owner', 'repo_owner', 'organization'], owner);
   assign(['repo', 'repository', 'repo_name'], repo);
   assign(['workflow_id', 'workflow', 'workflow_file', 'workflow_filename'], workflow);
@@ -76,43 +78,52 @@ function buildArguments(schema = {}) {
   return args;
 }
 
-const base = `https://api.smithery.ai/connect/${encodeURIComponent(namespace)}`;
-const listed = await request(base, { method: 'GET' });
-const connection = connectionList(listed).find(isGitHub);
-if (!connection) throw new Error(`No GitHub connection found in Smithery namespace ${namespace}`);
-const id = connectionId(connection);
-if (!id) throw new Error('Smithery GitHub connection has no usable connection ID');
+run(['namespace', 'use', namespace]);
 
-const mcpUrl = `${base}/${encodeURIComponent(id)}/mcp`;
-const toolList = await request(mcpUrl, {
-  method: 'POST',
-  body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
-});
-const tools = toolsFrom(toolList);
-const candidates = ['actions_run_trigger', 'create_workflow_dispatch', 'workflow_dispatch', 'run_workflow'];
-const tool = candidates.map((name) => tools.find((item) => item.name === name)).find(Boolean);
-if (!tool) throw new Error(`Smithery GitHub connection lacks a workflow trigger tool; observed ${tools.length} tools`);
+const listed = run(['--json', 'tool', 'list', connectionId]);
+const payload = parseJson(listed.stdout, 'smithery tool list');
+const tools = collectTools(payload);
+const preferredNames = [
+  'actions_run_trigger',
+  'create_workflow_dispatch',
+  'workflow_dispatch',
+  'run_workflow',
+];
+const tool = preferredNames
+  .map((name) => tools.find((candidate) => candidate.name === name))
+  .find(Boolean);
 
-const result = await request(mcpUrl, {
-  method: 'POST',
-  body: JSON.stringify({
-    jsonrpc: '2.0',
-    id: 2,
-    method: 'tools/call',
-    params: { name: tool.name, arguments: buildArguments(tool.inputSchema || {}) },
-  }),
-});
-if (result?.error || result?.result?.isError) throw new Error(`Smithery tool call failed: ${JSON.stringify(redact(result))}`);
+if (!tool) {
+  const observed = [...new Set(tools.map((candidate) => candidate.name))].sort();
+  throw new Error(`No compatible workflow trigger tool found on ${connectionId}; observed: ${observed.join(', ') || 'none'}`);
+}
+
+const schema = tool.inputSchema || tool.input_schema || {};
+const args = buildArguments(schema);
+const called = run([
+  '--json',
+  'tool',
+  'call',
+  connectionId,
+  tool.name,
+  JSON.stringify(args),
+]);
+const result = parseJson(called.stdout, 'smithery tool call');
+
+if (result?.error || result?.isError || result?.result?.isError) {
+  throw new Error(`Smithery GitHub tool returned an error: ${JSON.stringify(redact(result))}`);
+}
 
 console.log(JSON.stringify({
-  schema_version: '1.0.0',
+  schema_version: '2.0.0',
   status: 'triggered',
-  route: 'smithery-connect-github',
+  route: 'smithery-cli-managed-github',
   namespace,
-  connection_id: id,
+  connection_id: connectionId,
   tool: tool.name,
   target: `${owner}/${repo}`,
   workflow,
   ref,
-  result: redact(result?.result || result),
+  arguments: args,
+  result: redact(result),
 }, null, 2));
