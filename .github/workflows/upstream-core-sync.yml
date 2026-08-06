@@ -124,8 +124,6 @@ jobs:
               exit 1
             fi
 
-            # Rebuild the root npm lock from the merged manifests so local-only
-            # workspaces remain represented while upstream owns shared manifests.
             if printf '%s\n' "${conflicts[@]}" | grep -qx 'package-lock.json'; then
               npm install --package-lock-only --ignore-scripts
               git add package-lock.json
@@ -135,6 +133,15 @@ jobs:
             echo 'resolution=upstream-shared-local-additive' >> "$GITHUB_OUTPUT"
           else
             echo 'resolution=clean-merge' >> "$GITHUB_OUTPUT"
+          fi
+
+          # Workflow policy remains GlacierEQ-controlled. This also prevents a
+          # normal GITHUB_TOKEN from being asked to push upstream workflow files.
+          rm -rf .github/workflows
+          git checkout "${SOURCE_REF}" -- .github/workflows
+          git add -A .github/workflows
+          if ! git diff --cached --quiet; then
+            git commit --amend --no-edit
           fi
 
           echo 'status=merged' >> "$GITHUB_OUTPUT"
@@ -175,14 +182,16 @@ jobs:
           - Upstream commits incorporated: **${BEHIND}**
           - GlacierEQ-local commits preserved: **${AHEAD}**
           - Conflict resolution: \`${RESOLUTION}\`
+          - Workflow policy: \`GlacierEQ-controlled; upstream .github/workflows excluded\`
           - Verification: \`node scripts/verify-core-sync.mjs\`
           - Trigger run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
 
           ### Deterministic policy
           1. Upstream wins conflicts in shared dependency manifests and generated lockfiles.
           2. GlacierEQ-only servers and files remain in the merged tree.
-          3. The root npm lock is regenerated after reconciliation.
-          4. Any conflict outside the allowlisted dependency/lockfile paths stops at an approval gate.
+          3. GlacierEQ retains exclusive control of `.github/workflows`.
+          4. The root npm lock is regenerated after reconciliation.
+          5. Any conflict outside the allowlisted dependency/lockfile paths stops at an approval gate.
           EOF
 
           pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$SYNC_BRANCH" --base main --state open --json number --jq '.[0].number // empty')"
