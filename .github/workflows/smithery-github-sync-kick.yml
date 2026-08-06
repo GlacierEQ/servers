@@ -8,7 +8,9 @@ on:
     branches: [main]
     paths:
       - .github/workflows/smithery-github-sync-kick.yml
-      - .github/SMITHERY_SETUP.md
+      - .github/workflows/upstream-core-sync.yml
+      - .github/core-sync-policy.yml
+      - scripts/verify-core-sync.mjs
 
 permissions:
   id-token: write
@@ -19,25 +21,35 @@ concurrency:
   group: smithery-github-sync-kick
   cancel-in-progress: false
 
+env:
+  CREDENTIAL_BROKER_URL: https://unified-credential-mcp-gkw2.vercel.app/api/operations/smithery-github-sync
+  OIDC_AUDIENCE: unified-credential-mcp
+
 jobs:
   trigger:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
+      - name: Record trigger start
+        id: started
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Probe credential broker
+        id: health
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error \
+            https://unified-credential-mcp-gkw2.vercel.app/api/health \
+            | tee /tmp/credential-broker-health.json
+          jq -e '.ok == true' /tmp/credential-broker-health.json >/dev/null
+
       - name: Trigger through unified credential broker
         id: broker
         continue-on-error: true
-        env:
-          CREDENTIAL_BROKER_URL: ${{ vars.CREDENTIAL_BROKER_URL }}
-          OIDC_AUDIENCE: unified-credential-mcp
         run: |
           set -euo pipefail
-          if [[ -z "${CREDENTIAL_BROKER_URL:-}" ]]; then
-            echo 'CREDENTIAL_BROKER_URL repository variable is not configured.' >&2
-            exit 78
-          fi
-
           separator='?'
           if [[ "${ACTIONS_ID_TOKEN_REQUEST_URL}" == *'?'* ]]; then separator='&'; fi
           oidc_response="$(curl --fail --silent --show-error \
@@ -53,22 +65,26 @@ jobs:
             --data '{}' \
             | tee /tmp/credential-broker-sync-receipt.json
 
+          jq -e '.status == "triggered"' /tmp/credential-broker-sync-receipt.json >/dev/null
+
       - name: Fallback to repository-scoped GitHub token
         id: fallback
         if: steps.broker.outcome != 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           gh workflow run upstream-core-sync.yml \
             --repo "$GITHUB_REPOSITORY" \
             --ref main \
             -f upstream_ref=main
 
-      - name: Verify a new upstream sync run exists
+      - name: Verify a newly-created upstream sync run
         env:
           GH_TOKEN: ${{ github.token }}
           BROKER_OUTCOME: ${{ steps.broker.outcome }}
           FALLBACK_OUTCOME: ${{ steps.fallback.outcome }}
+          START_EPOCH: ${{ steps.started.outputs.epoch }}
         run: |
           set -euo pipefail
           echo "Credential broker outcome: ${BROKER_OUTCOME}" >> "$GITHUB_STEP_SUMMARY"
@@ -79,11 +95,15 @@ jobs:
             gh run list \
               --repo "$GITHUB_REPOSITORY" \
               --workflow upstream-core-sync.yml \
-              --limit 10 \
+              --limit 20 \
               --json databaseId,event,status,conclusion,headSha,createdAt,url \
               | tee /tmp/upstream-sync-runs.json
 
-            count="$(jq 'length' /tmp/upstream-sync-runs.json)"
+            jq --argjson start "$START_EPOCH" '
+              [ .[] | select((.createdAt | fromdateiso8601) >= $start) ]
+            ' /tmp/upstream-sync-runs.json > /tmp/new-upstream-sync-runs.json
+
+            count="$(jq 'length' /tmp/new-upstream-sync-runs.json)"
             if [[ "$count" -ge 1 ]]; then
               found=1
               break
@@ -92,16 +112,22 @@ jobs:
           done
 
           if [[ "$found" -ne 1 ]]; then
-            echo 'No upstream-core-sync run was observable after either trigger route.' >&2
+            echo 'No newly-created upstream-core-sync run was observable after either trigger route.' >&2
             exit 1
           fi
 
+          jq '.[0]' /tmp/new-upstream-sync-runs.json | tee /tmp/upstream-sync-run-receipt.json
+
       - name: Upload sanitized trigger receipts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: credential-broker-sync-kick-${{ github.run_id }}
           path: |
+            /tmp/credential-broker-health.json
             /tmp/credential-broker-sync-receipt.json
             /tmp/upstream-sync-runs.json
+            /tmp/new-upstream-sync-runs.json
+            /tmp/upstream-sync-run-receipt.json
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 30
