@@ -10,9 +10,7 @@ on:
   schedule:
     - cron: '17 */6 * * *'
   push:
-    branches:
-      - main
-      - sync-core-bootstrap-20260803
+    branches: [main]
     paths:
       - .github/workflows/upstream-core-sync.yml
       - .github/core-sync-policy.yml
@@ -21,7 +19,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  issues: write
 
 concurrency:
   group: upstream-core-sync
@@ -30,8 +27,7 @@ concurrency:
 env:
   UPSTREAM_REPOSITORY: modelcontextprotocol/servers
   SYNC_BRANCH: automation/upstream-core-sync
-  CONFLICT_ISSUE_TITLE: Upstream core synchronization conflict
-  SOURCE_REF: ${{ github.event_name == 'push' && github.ref_name || 'main' }}
+  SOURCE_REF: main
 
 jobs:
   synchronize:
@@ -54,6 +50,7 @@ jobs:
         env:
           UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
         run: |
+          set -euo pipefail
           git remote remove upstream 2>/dev/null || true
           git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
           git fetch --prune --no-tags upstream "${UPSTREAM_REF}"
@@ -69,7 +66,6 @@ jobs:
           merge_base="$(git merge-base HEAD refs/remotes/upstream/core)"
           behind="$(git rev-list --count HEAD..refs/remotes/upstream/core)"
           ahead="$(git rev-list --count refs/remotes/upstream/core..HEAD)"
-
           {
             echo "local_sha=${local_sha}"
             echo "upstream_sha=${upstream_sha}"
@@ -77,43 +73,72 @@ jobs:
             echo "behind=${behind}"
             echo "ahead=${ahead}"
           } >> "$GITHUB_OUTPUT"
-
           {
             echo '## Upstream core divergence'
-            echo
-            echo "- GlacierEQ source ref: \`${SOURCE_REF}\`"
-            echo "- GlacierEQ source SHA: \`${local_sha}\`"
-            echo "- Upstream core: \`${upstream_sha}\`"
+            echo "- GlacierEQ source: \`${local_sha}\`"
+            echo "- Upstream source: \`${upstream_sha}\`"
             echo "- Merge base: \`${merge_base}\`"
             echo "- Upstream commits pending: **${behind}**"
-            echo "- GlacierEQ-local commits: **${ahead}**"
+            echo "- GlacierEQ-local commits preserved: **${ahead}**"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stop when already synchronized
         if: steps.divergence.outputs.behind == '0'
-        run: echo 'GlacierEQ/servers already contains the selected upstream core.'
+        run: echo 'No upstream change.'
 
-      - name: Merge upstream into isolated sync branch
+      - name: Merge and reconcile upstream core
         if: steps.divergence.outputs.behind != '0'
         id: merge
         shell: bash
         run: |
           set -euo pipefail
           git checkout -B "${SYNC_BRANCH}" "${SOURCE_REF}"
+
           set +e
           git merge --no-ff --no-edit refs/remotes/upstream/core
           merge_status=$?
           set -e
 
           if [[ $merge_status -ne 0 ]]; then
-            conflict_files="$(git diff --name-only --diff-filter=U | sort)"
-            printf '%s\n' "$conflict_files" > /tmp/upstream-sync-conflicts.txt
-            git merge --abort
-            echo 'status=conflict' >> "$GITHUB_OUTPUT"
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U | sort)
+            unexpected=()
+
+            for file in "${conflicts[@]}"; do
+              case "$file" in
+                package-lock.json|src/*/package.json|src/*/uv.lock)
+                  echo "Resolving shared generated/dependency file from upstream: $file"
+                  git checkout --theirs -- "$file"
+                  git add "$file"
+                  ;;
+                *)
+                  unexpected+=("$file")
+                  ;;
+              esac
+            done
+
+            if (( ${#unexpected[@]} > 0 )); then
+              {
+                echo '## Approval gate: unexpected upstream conflicts'
+                printf -- '- `%s`\n' "${unexpected[@]}"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+
+            # Rebuild the root npm lock from the merged manifests so local-only
+            # workspaces remain represented while upstream owns shared manifests.
+            if printf '%s\n' "${conflicts[@]}" | grep -qx 'package-lock.json'; then
+              npm install --package-lock-only --ignore-scripts
+              git add package-lock.json
+            fi
+
+            git commit --no-edit
+            echo 'resolution=upstream-shared-local-additive' >> "$GITHUB_OUTPUT"
           else
-            echo 'status=merged' >> "$GITHUB_OUTPUT"
-            git rev-parse HEAD > /tmp/upstream-sync-head.txt
+            echo 'resolution=clean-merge' >> "$GITHUB_OUTPUT"
           fi
+
+          echo 'status=merged' >> "$GITHUB_OUTPUT"
+          git rev-parse HEAD > /tmp/upstream-sync-head.txt
 
       - name: Verify merged core before push
         if: steps.merge.outputs.status == 'merged'
@@ -121,7 +146,7 @@ jobs:
 
       - name: Push synchronized branch
         if: steps.merge.outputs.status == 'merged'
-        run: git push --force-with-lease origin "HEAD:refs/heads/${SYNC_BRANCH}"
+        run: git push --force origin "HEAD:refs/heads/${SYNC_BRANCH}"
 
       - name: Create or refresh synchronization pull request
         if: steps.merge.outputs.status == 'merged'
@@ -132,6 +157,7 @@ jobs:
           MERGE_BASE: ${{ steps.divergence.outputs.merge_base }}
           BEHIND: ${{ steps.divergence.outputs.behind }}
           AHEAD: ${{ steps.divergence.outputs.ahead }}
+          RESOLUTION: ${{ steps.merge.outputs.resolution }}
         shell: bash
         run: |
           set -euo pipefail
@@ -140,22 +166,23 @@ jobs:
           cat > "$body_file" <<EOF
           ## Automated upstream-core synchronization
 
-          This pull request merges the official \`${UPSTREAM_REPOSITORY}\` core into \`GlacierEQ/servers\` without replacing GlacierEQ-local commits.
+          Official upstream servers and shared server implementations are updated from \`${UPSTREAM_REPOSITORY}\`. GlacierEQ-only servers and files remain additive.
 
           ### Receipt
-
-          - GlacierEQ source ref: \`${SOURCE_REF}\`
           - GlacierEQ source: \`${LOCAL_SHA}\`
           - Upstream head: \`${UPSTREAM_SHA}\`
           - Merge base: \`${MERGE_BASE}\`
           - Upstream commits incorporated: **${BEHIND}**
           - GlacierEQ-local commits preserved: **${AHEAD}**
+          - Conflict resolution: \`${RESOLUTION}\`
           - Verification: \`node scripts/verify-core-sync.mjs\`
           - Trigger run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
 
-          ### Merge policy
-
-          The workflow never force-pushes \`main\`, never resolves conflicts with \`ours\` or \`theirs\`, and never discards GlacierEQ-local history. Conflicts are routed to a durable issue instead of being guessed away.
+          ### Deterministic policy
+          1. Upstream wins conflicts in shared dependency manifests and generated lockfiles.
+          2. GlacierEQ-only servers and files remain in the merged tree.
+          3. The root npm lock is regenerated after reconciliation.
+          4. Any conflict outside the allowlisted dependency/lockfile paths stops at an approval gate.
           EOF
 
           pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$SYNC_BRANCH" --base main --state open --json number --jq '.[0].number // empty')"
@@ -164,43 +191,3 @@ jobs:
           else
             gh pr create --repo "$GITHUB_REPOSITORY" --head "$SYNC_BRANCH" --base main --title "$title" --body-file "$body_file"
           fi
-
-      - name: Record conflict without mutating core
-        if: steps.merge.outputs.status == 'conflict'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          LOCAL_SHA: ${{ steps.divergence.outputs.local_sha }}
-          UPSTREAM_SHA: ${{ steps.divergence.outputs.upstream_sha }}
-          MERGE_BASE: ${{ steps.divergence.outputs.merge_base }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          body_file=/tmp/upstream-sync-conflict.md
-          conflicts="$(cat /tmp/upstream-sync-conflicts.txt)"
-          cat > "$body_file" <<EOF
-          ## Upstream core synchronization conflict
-
-          The scheduled synchronization stopped without changing \`main\` because upstream and GlacierEQ-local edits conflict.
-
-          - GlacierEQ source ref: \`${SOURCE_REF}\`
-          - GlacierEQ source: \`${LOCAL_SHA}\`
-          - Upstream head: \`${UPSTREAM_SHA}\`
-          - Merge base: \`${MERGE_BASE}\`
-          - Trigger run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
-
-          ### Conflicting paths
-
-          \`\`\`
-          ${conflicts}
-          \`\`\`
-
-          No automatic conflict preference was applied. The existing core remains intact.
-          EOF
-
-          issue_number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "${CONFLICT_ISSUE_TITLE} in:title" --json number,title --jq '.[] | select(.title == env.CONFLICT_ISSUE_TITLE) | .number' | head -n1)"
-          if [[ -n "$issue_number" ]]; then
-            gh issue comment "$issue_number" --repo "$GITHUB_REPOSITORY" --body-file "$body_file"
-          else
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$CONFLICT_ISSUE_TITLE" --body-file "$body_file"
-          fi
-          exit 1
