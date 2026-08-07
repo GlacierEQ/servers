@@ -1,6 +1,10 @@
 # Time MCP Server
 
+<!-- mcp-name: io.github.modelcontextprotocol/server-time -->
+
 A Model Context Protocol server that provides time and timezone conversion capabilities. This server enables LLMs to get current time information and perform timezone conversions using IANA timezone names, with automatic system timezone detection.
+
+Source: https://github.com/modelcontextprotocol/servers/tree/main/src/time
 
 ### Available Tools
 
@@ -20,6 +24,10 @@ A Model Context Protocol server that provides time and timezone conversion capab
 
 When using [`uv`](https://docs.astral.sh/uv/) no specific installation is needed. We will
 use [`uvx`](https://docs.astral.sh/uv/guides/tools/) to directly run *mcp-server-time*.
+
+```bash
+uvx mcp-server-time
+```
 
 ### Using PIP
 
