@@ -57,13 +57,81 @@ for (const file of files) {
 record('no_conflict_markers', conflictFiles.length === 0, conflictFiles.join(', ') || 'none');
 record('oversized_file_inventory', true, oversized.join(', ') || 'none');
 
+// TypeScript tsconfig files are JSONC (comments and trailing commas are valid).
+// Keep strict JSON parsing for every other .json file.
+function parseJsonc(source) {
+  let stripped = '';
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < source.length; i++) {
+    const char = source[i];
+    const next = source[i + 1];
+    if (inString) {
+      stripped += char;
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+    } else if (char === '"') {
+      inString = true;
+      stripped += char;
+    } else if (char === '/' && next === '/') {
+      i += 2;
+      while (i < source.length && source[i] !== '\n') i++;
+      if (i < source.length) stripped += '\n';
+    } else if (char === '/' && next === '*') {
+      i += 2;
+      let closed = false;
+      while (i < source.length) {
+        if (source[i] === '*' && source[i + 1] === '/') {
+          i++;
+          closed = true;
+          break;
+        }
+        if (source[i] === '\n') stripped += '\n';
+        i++;
+      }
+      if (!closed) throw new Error('unterminated JSONC block comment');
+    } else {
+      stripped += char;
+    }
+  }
+  let normalized = '';
+  inString = false;
+  escaped = false;
+  for (let i = 0; i < stripped.length; i++) {
+    const char = stripped[i];
+    if (inString) {
+      normalized += char;
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+    } else if (char === '"') {
+      inString = true;
+      normalized += char;
+    } else if (char === ',') {
+      let next = i + 1;
+      while (next < stripped.length && /\\s/.test(stripped[next])) next++;
+      if (stripped[next] !== '}' && stripped[next] !== ']') normalized += char;
+    } else {
+      normalized += char;
+    }
+  }
+  return JSON.parse(normalized);
+}
+
 const jsonFiles = files.filter((file) => file.endsWith('.json'));
 const jsonErrors = [];
 for (const file of jsonFiles) {
-  try { JSON.parse(readFileSync(file, 'utf8')); }
-  catch (error) { jsonErrors.push(`${relative(root, file)}:${error.message}`); }
+  try {
+    const source = readFileSync(file, 'utf8');
+    const path = relative(root, file);
+    if (/(^|\\/)tsconfig(?:\\.[^/]+)?\\.json$/.test(path)) parseJsonc(source);
+    else JSON.parse(source);
+  } catch (error) {
+    jsonErrors.push(`${relative(root, file)}:${error.message}`);
+  }
 }
-record('json_parse', jsonErrors.length === 0, jsonErrors.join(' | ') || `${jsonFiles.length} files parsed`);
+record('json_parse', jsonErrors.length === 0, jsonErrors.join(' | ') || `${jsonFiles.length} JSON/JSONC files parsed`);
 
 try {
   const packageJson = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
