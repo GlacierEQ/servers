@@ -105,6 +105,14 @@ jobs:
 
             for file in "${conflicts[@]}"; do
               case "$file" in
+                .github/workflows/*)
+                  # Workflow files are GlacierEQ-owned policy, never upstream content.
+                  # Resolve these before the unexpected-conflict gate; the later
+                  # source-ref checkout preserves the complete local workflow tree.
+                  echo "Preserving GlacierEQ workflow policy: $file"
+                  git checkout --ours -- "$file"
+                  git add "$file"
+                  ;;
                 package-lock.json|src/*/package.json|src/*/uv.lock)
                   echo "Resolving shared generated/dependency file from upstream: $file"
                   git checkout --theirs -- "$file"
