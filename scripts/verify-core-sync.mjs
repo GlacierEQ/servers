@@ -125,7 +125,8 @@ for (const file of jsonFiles) {
   try {
     const source = readFileSync(file, 'utf8');
     const path = relative(root, file);
-    if (/(^|\\/)tsconfig(?:\\.[^/]+)?\\.json$/.test(path)) parseJsonc(source);
+    const name = path.split('/').at(-1);
+    if (name === 'tsconfig.json' || (name.startsWith('tsconfig.') && name.endsWith('.json'))) parseJsonc(source);
     else JSON.parse(source);
   } catch (error) {
     jsonErrors.push(`${relative(root, file)}:${error.message}`);
