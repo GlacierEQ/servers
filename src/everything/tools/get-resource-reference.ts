@@ -1,6 +1,5 @@
 import { z } from "zod";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { McpServer, CallToolResult } from "@modelcontextprotocol/server";
 import {
   textResource,
   textResourceUri,
@@ -56,9 +55,10 @@ export const registerGetResourceReferenceTool = (server: McpServer) => {
   server.registerTool(name, config, async (args): Promise<CallToolResult> => {
     // Validate resource type argument
     const { resourceType } = args;
+    /* v8 ignore next -- unreachable: the input schema's enum rejects any other resourceType before the handler runs */
     if (!RESOURCE_TYPES.includes(resourceType)) {
       throw new Error(
-        `Invalid resourceType: ${args?.resourceType}. Must be ${RESOURCE_TYPE_TEXT} or ${RESOURCE_TYPE_BLOB}.`
+        `Invalid resourceType: ${args?.resourceType}. Must be ${RESOURCE_TYPE_TEXT} or ${RESOURCE_TYPE_BLOB}.`,
       );
     }
 
@@ -70,7 +70,7 @@ export const registerGetResourceReferenceTool = (server: McpServer) => {
       resourceId < 1
     ) {
       throw new Error(
-        `Invalid resourceId: ${args?.resourceId}. Must be a finite positive integer.`
+        `Invalid resourceId: ${args?.resourceId}. Must be a finite positive integer.`,
       );
     }
 

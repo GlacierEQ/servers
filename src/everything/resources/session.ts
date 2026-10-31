@@ -1,12 +1,20 @@
-import { McpServer, RegisteredResource } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Resource, ResourceLink } from "@modelcontextprotocol/sdk/types.js";
+import {
+  McpServer,
+  RegisteredResource,
+  Resource,
+  ResourceLink,
+} from "@modelcontextprotocol/server";
 
 /**
- * Tracks registered session resources by URI to allow updating/removing on re-registration.
- * This prevents "Resource already registered" errors when a tool creates a resource
- * with the same URI multiple times during a session.
+ * Tracks registered session resources per server, by URI, to allow updating/removing on
+ * re-registration. This prevents "Resource already registered" errors when a tool creates
+ * a resource with the same URI multiple times during a session, without touching another
+ * session's server that registered the same URI (#4808).
  */
-const registeredResources = new Map<string, RegisteredResource>();
+const registeredResources = new WeakMap<
+  McpServer,
+  Map<string, RegisteredResource>
+>();
 
 /**
  * Generates a session-scoped resource URI string based on the provided resource name.
@@ -33,7 +41,7 @@ export const registerSessionResource = (
   server: McpServer,
   resource: Resource,
   type: "text" | "blob",
-  payload: string
+  payload: string,
 ): ResourceLink => {
   // Destructure resource
   const { uri, name, mimeType, description, title, annotations, icons, _meta } =
@@ -54,11 +62,16 @@ export const registerSessionResource = (
           blob: payload,
         };
 
-  // Check if a resource with this URI is already registered and remove it
-  const existingResource = registeredResources.get(uri);
+  const serverResources =
+    registeredResources.get(server) ?? new Map<string, RegisteredResource>();
+  registeredResources.set(server, serverResources);
+
+  // Check if a resource with this URI is already registered on this server and remove it
+  const resourceKey = uri.toString();
+  const existingResource = serverResources.get(resourceKey);
   if (existingResource) {
     existingResource.remove();
-    registeredResources.delete(uri);
+    serverResources.delete(resourceKey);
   }
 
   // Register file resource
@@ -70,11 +83,11 @@ export const registerSessionResource = (
       return {
         contents: [resourceContent],
       };
-    }
+    },
   );
 
   // Track the registered resource for potential future removal
-  registeredResources.set(uri, registeredResource);
+  serverResources.set(resourceKey, registeredResource);
 
   return { type: "resource_link", ...resource };
 };

@@ -8,6 +8,8 @@ A Model Context Protocol server for Git repository interaction and automation. T
 
 Source: https://github.com/modelcontextprotocol/servers/tree/main/src/git
 
+Requires MCP Python SDK 2.x (`mcp>=2.3,<3`). The server is built on the SDK's high-level `MCPServer`: each tool is a typed Python function, and the SDK derives its input schema from the signature.
+
 Please note that mcp-server-git is currently in early development. The functionality and available tools are subject to change and expansion as we continue to develop and improve the server.
 
 ### Tools
@@ -45,14 +47,14 @@ Please note that mcp-server-git is currently in early development. The functiona
    - Inputs:
      - `repo_path` (string): Path to Git repository
      - `message` (string): Commit message
-   - Returns: Confirmation with new commit hash
+   - Returns: Confirmation with new commit hash; an error if nothing is staged (as `git commit` without `--allow-empty`), except while a merge is in progress (`MERGE_HEAD` present), where git also allows an empty commit. While a merge is in progress the commit concludes it: its parents are `HEAD` and every `MERGE_HEAD` commit, and the merge state is cleared
 
 6. `git_add`
    - Adds file contents to the staging area
    - Inputs:
      - `repo_path` (string): Path to Git repository
-     - `files` (string[]): Array of file paths to stage
-   - Returns: Confirmation of staged files
+     - `files` (string[]): Non-empty array of file paths to stage; `["."]` stages everything
+   - Returns: Confirmation of staged files, or a message saying nothing was staged when the call left the index unchanged
 
 7. `git_reset`
    - Unstages all staged changes
@@ -74,20 +76,20 @@ Please note that mcp-server-git is currently in early development. The functiona
    - Inputs:
      - `repo_path` (string): Path to Git repository
      - `branch_name` (string): Name of the new branch
-     - `base_branch` (string, optional): Base branch to create from (defaults to current branch)
-   - Returns: Confirmation of branch creation
+     - `base_branch` (string, optional): Branch, tag or commit SHA to create from (defaults to the current branch, or to the current commit when HEAD is detached)
+   - Returns: Confirmation of branch creation, naming the base branch, or the short SHA when the base is a commit
 10. `git_checkout`
    - Switches branches
    - Inputs:
      - `repo_path` (string): Path to Git repository
      - `branch_name` (string): Name of branch to checkout
-   - Returns: Confirmation of branch switch
+   - Returns: Confirmation of branch switch, or `HEAD is now detached at <short sha>` when `branch_name` is not a branch (a sha, tag or other revision)
 11. `git_show`
-   - Shows the contents of a commit
+   - Shows the contents of a commit, or of a file or directory at a revision
    - Inputs:
      - `repo_path` (string): Path to Git repository
-     - `revision` (string): The revision (commit hash, branch name, tag) to show
-   - Returns: Contents of the specified commit
+     - `revision` (string): The revision (commit hash, branch name, tag) or object spec (`HEAD:path/to/file`) to show
+   - Returns: Contents of the specified commit, file content, or directory listing
 
 12. `git_branch`
    - List Git branches
@@ -97,6 +99,17 @@ Please note that mcp-server-git is currently in early development. The functiona
      - `contains` (string, optional): The commit sha that branch should contain. Do not pass anything to this param if no commit sha is specified
      - `not_contains` (string, optional): The commit sha that branch should NOT contain. Do not pass anything to this param if no commit sha is specified
    - Returns: List of branches
+
+### Protocol versions
+
+The server speaks both eras of the Model Context Protocol over stdio, with nothing to configure: a **2026-07-28** client (discovered with `server/discover`, no session) and a **2025-11-25** client (the `initialize` handshake). The client's first request decides which. Tools behave the same in both.
+
+Roots is deprecated in 2026-07-28, and this server never asks a client for Roots in either era: repository access comes from `--repository` alone, or, with no `--repository`, from each tool call's `repo_path`. Methods the 2026-07-28 specification removes, such as `ping`, are answered only on a 2025-11-25 connection.
+
+### Errors
+
+- **A tool that fails** returns a result with `isError: true` whose text is `Error executing tool <name>: <message>`, so the model can read it and correct the call. This covers git errors (an unknown revision, a failed command), a `repo_path` that is not a repository or is outside `--repository`, the flag-injection guards, and arguments that do not match the tool's input schema.
+- **An unknown tool name** is a protocol error, JSON-RPC `-32602` (`Unknown tool: <name>`), as the specification requires in both eras. Before 2.0.0 it was an `isError` result.
 
 ## Installation
 
@@ -120,6 +133,13 @@ python -m mcp_server_git
 ```
 
 ## Configuration
+
+> [!IMPORTANT]
+> **Without `--repository`, the server reads and writes any Git repository the server process can reach.** Each tool call names its own `repo_path`, and that holds for the tools that change a repository too (`git_add`, `git_commit`, `git_reset`, `git_create_branch`, `git_checkout`). `--repository` is the only confinement the server offers: it never asks the client for Roots, in either protocol era. Set `--repository` whenever the server is used with prompts or content that are not fully trusted. It admits the whole enclosing repository, not only the directory you name, as the next paragraph describes.
+
+`--repository` (`-r`) accepts any path inside a Git working tree. At startup the server walks up to the enclosing repository root, the way `git rev-parse --show-toplevel` does, so `--repository .` works when a shared config is launched from any subdirectory of the repository. A path inside the repository therefore allows tool calls anywhere in that repository, not only under the subdirectory given. A path that does not exist, or is not inside a Git repository, is logged as a one-line error at startup.
+
+A tool call's `repo_path` must be inside that repository, and so must the directories Git then uses for it: a repository nested inside whose `.git` file, `commondir` or `core.worktree` points outside is refused. A linked worktree can still be the `--repository`, though its Git directory lives under the main repository's `.git`.
 
 ### Usage with Claude Desktop
 
@@ -288,7 +308,25 @@ help you debug any issues.
 
 ## Development
 
-If you are doing local development, there are two ways to test your changes:
+### Tests and coverage
+
+The test suite drives `serve()` in-process through an MCP `ClientSession`
+(see `tests/conftest.py`), and `tests/test_eras.py` runs a `Client` against it
+as a 2026-07-28 and as a 2025-11-25 client. From `src/git`:
+
+```bash
+uv run --frozen pytest                 # the tests
+uv run --frozen pytest --cov --cov-report=term-missing --cov-report=json
+```
+
+The second command adds branch coverage of `src/mcp_server_git`, printed per
+file and written to `coverage.json` (ignored by git). Every file must stay at
+or above 90% of its lines and 90% of its branches. Code that cannot be reached
+is marked `# pragma: no cover  # <reason>` rather than lowering that bar.
+
+### Trying changes in a client
+
+There are two ways to try your changes in a client:
 
 1. Run the MCP inspector to test your changes. See [Debugging](#debugging) for run instructions.
 

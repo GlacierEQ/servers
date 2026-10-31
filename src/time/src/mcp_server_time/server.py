@@ -1,17 +1,40 @@
-from datetime import datetime, timedelta
-from enum import Enum
-import json
-from typing import Sequence
+# The time MCP server: `get_current_time` and `convert_time` over IANA
+# timezones, with the local timezone detected (or set with --local-timezone)
+# and named in the tool descriptions so a model can default to it.
+#
+# Built on the MCP Python SDK's high-level `MCPServer` (#5174), which these
+# reference servers use to show the SDK's recommended API. Each tool is a
+# typed function: `MCPServer` derives its input schema from the parameters,
+# validates arguments, and returns the pydantic result model as both
+# `structuredContent` (with an `outputSchema`) and a JSON text block. A
+# failure the tool anticipates raises `ToolError`, which the model reads as an
+# `isError` result. An unknown tool name is a JSON-RPC `-32602` protocol error,
+# as both spec revisions require (see `reject_unknown_tools`). `serve()` serves
+# both protocol eras (#4853): a 2025-11-25 client through the initialize
+# handshake, and a 2026-07-28 client sessionlessly. No tool reads the session
+# or calls back to the client, so nothing differs between them.
 
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta
+from functools import cache
+from importlib.metadata import version
+from enum import Enum
+import sys
+from typing import Annotated, Any
+
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 from tzlocal import get_localzone_name  # ← returns "Europe/Paris", etc.
 
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import Tool, ToolAnnotations, TextContent, ImageContent, EmbeddedResource, ErrorData, INVALID_PARAMS
-from mcp.shared.exceptions import McpError
+from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.shared.exceptions import MCPError
+from mcp.types import INVALID_PARAMS, ToolAnnotations
+from pydantic import BaseModel, Field
 
-from pydantic import BaseModel
+# The version this server reports in serverInfo, read from the installed
+# distribution's metadata (pyproject.toml) so it cannot drift from the
+# published version (#360). Without it the SDK reports its own `mcp` version.
+SERVER_VERSION = version("mcp-server-time")
 
 
 class TimeTools(str, Enum):
@@ -50,11 +73,33 @@ def get_local_tz(local_tz_override: str | None = None) -> ZoneInfo:
     return ZoneInfo("UTC")
 
 
+@cache
+def known_timezones() -> frozenset[str]:
+    """The exact IANA keys this host's tz database holds, read once."""
+    return frozenset(available_timezones())
+
+
+def load_zoneinfo(timezone_name: str) -> ZoneInfo:
+    """`ZoneInfo(timezone_name)`, accepting only an exact IANA key.
+
+    zoneinfo looks a key up as a file path, so on a case-insensitive
+    filesystem (macOS's APFS) `europe/warsaw` resolves to `Europe/Warsaw`
+    while Linux rejects it (#5060). Checking the key against the database's
+    own list makes every platform reject it. `ZoneInfo` runs first so a path
+    or a directory keeps the error zoneinfo gives it.
+    """
+    zone = ZoneInfo(timezone_name)
+    if timezone_name not in known_timezones():
+        raise ZoneInfoNotFoundError(f"No time zone found with key {timezone_name}")
+    return zone
+
+
 def get_zoneinfo(timezone_name: str) -> ZoneInfo:
+    """`load_zoneinfo`, failing with a `ToolError` the model can read."""
     try:
-        return ZoneInfo(timezone_name)
+        return load_zoneinfo(timezone_name)
     except Exception as e:
-        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Invalid timezone: {str(e)}"))
+        raise ToolError(f"Invalid timezone: {str(e)}") from e
 
 
 class TimeServer:
@@ -80,7 +125,7 @@ class TimeServer:
         try:
             parsed_time = datetime.strptime(time_str, "%H:%M").time()
         except ValueError:
-            raise ValueError("Invalid time format. Expected HH:MM [24-hour format]")
+            raise ToolError("Invalid time format. Expected HH:MM [24-hour format]")
 
         now = datetime.now(source_timezone)
         source_time = datetime(
@@ -91,6 +136,15 @@ class TimeServer:
             parsed_time.minute,
             tzinfo=source_timezone,
         )
+
+        # A wall-clock time skipped by a clock change (e.g. 02:30 on a DST
+        # spring-forward day) does not survive a round trip through UTC.
+        round_trip = datetime.fromtimestamp(source_time.timestamp(), source_timezone)
+        if round_trip.replace(tzinfo=None) != source_time.replace(tzinfo=None):
+            raise ToolError(
+                f"Invalid time: {time_str} does not exist in {source_tz} on "
+                f"{source_time.date().isoformat()} (skipped by a clock change)"
+            )
 
         target_time = source_time.astimezone(target_timezone)
         source_offset = source_time.utcoffset() or timedelta()
@@ -120,101 +174,115 @@ class TimeServer:
         )
 
 
-async def serve(local_timezone: str | None = None) -> None:
-    server = Server("mcp-time")
+READ_ONLY = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
+
+
+def require(name: str, value: str) -> None:
+    """Report an empty timezone as missing, rather than as zoneinfo's own error."""
+    if not value:
+        raise ToolError(f"Missing required argument: {name}")
+
+
+def reject_unknown_tools(server: MCPServer) -> None:
+    """Answer a call to an unknown tool with JSON-RPC `-32602`.
+
+    Both spec revisions (2025-11-25 and 2026-07-28, server/tools "Error
+    Handling") make an unknown tool a protocol error, but `MCPServer` still
+    answers it with an `isError` result (python-sdk#3659). This middleware
+    rejects the name before `MCPServer` looks it up. Remove it once
+    `MCPServer` does this itself.
+    """
+
+    async def middleware(
+        ctx: ServerRequestContext[Any, Any], call_next: CallNext
+    ) -> HandlerResult:
+        if ctx.method == "tools/call" and ctx.params is not None:
+            name = ctx.params.get("name")
+            if isinstance(name, str) and name not in {
+                tool.name for tool in await server.list_tools()
+            }:
+                raise MCPError(code=INVALID_PARAMS, message=f"Unknown tool: {name}")
+        return await call_next(ctx)
+
+    server.middleware.append(middleware)
+
+
+def create_server(local_tz: str) -> MCPServer:
+    """The time server, with `local_tz` named in its tools' argument descriptions."""
     time_server = TimeServer()
-    local_tz = str(get_local_tz(local_timezone))
+    # The tools are fixed at startup, so there is no list change to listen
+    # for: `subscriptions=False` leaves 2026-07-28's `subscriptions/listen`
+    # unserved, and the server does not claim `listChanged` in either era.
+    server = MCPServer("mcp-time", version=SERVER_VERSION, subscriptions=False)
+    reject_unknown_tools(server)
 
-    @server.list_tools()
-    async def list_tools() -> list[Tool]:
-        """List available time tools."""
-        return [
-            Tool(
-                name=TimeTools.GET_CURRENT_TIME.value,
-                description="Get current time in a specific timezone",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "timezone": {
-                            "type": "string",
-                            "description": f"IANA timezone name (e.g., 'America/New_York', 'Europe/London'). Use '{local_tz}' as local timezone if no timezone provided by the user.",
-                        }
-                    },
-                    "required": ["timezone"],
-                },
-                annotations=ToolAnnotations(
-                    readOnlyHint=True,
-                    destructiveHint=False,
-                    idempotentHint=True,
-                    openWorldHint=False,
-                ),
+    @server.tool(
+        name=TimeTools.GET_CURRENT_TIME.value,
+        description="Get current time in a specific timezone",
+        annotations=READ_ONLY,
+    )
+    def get_current_time(
+        timezone: Annotated[
+            str,
+            Field(
+                description=f"IANA timezone name (e.g., 'America/New_York', 'Europe/London'). Use '{local_tz}' as local timezone if no timezone provided by the user."
             ),
-            Tool(
-                name=TimeTools.CONVERT_TIME.value,
-                description="Convert time between timezones",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "source_timezone": {
-                            "type": "string",
-                            "description": f"Source IANA timezone name (e.g., 'America/New_York', 'Europe/London'). Use '{local_tz}' as local timezone if no source timezone provided by the user.",
-                        },
-                        "time": {
-                            "type": "string",
-                            "description": "Time to convert in 24-hour format (HH:MM)",
-                        },
-                        "target_timezone": {
-                            "type": "string",
-                            "description": f"Target IANA timezone name (e.g., 'Asia/Tokyo', 'America/San_Francisco'). Use '{local_tz}' as local timezone if no target timezone provided by the user.",
-                        },
-                    },
-                    "required": ["source_timezone", "time", "target_timezone"],
-                },
-                annotations=ToolAnnotations(
-                    readOnlyHint=True,
-                    destructiveHint=False,
-                    idempotentHint=True,
-                    openWorldHint=False,
-                ),
-            ),
-        ]
+        ],
+    ) -> TimeResult:
+        require("timezone", timezone)
+        return time_server.get_current_time(timezone)
 
-    @server.call_tool()
-    async def call_tool(
-        name: str, arguments: dict
-    ) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
-        """Handle tool calls for time queries."""
+    @server.tool(
+        name=TimeTools.CONVERT_TIME.value,
+        description="Convert time between timezones",
+        annotations=READ_ONLY,
+    )
+    def convert_time(
+        source_timezone: Annotated[
+            str,
+            Field(
+                description=f"Source IANA timezone name (e.g., 'America/New_York', 'Europe/London'). Use '{local_tz}' as local timezone if no source timezone provided by the user."
+            ),
+        ],
+        time: Annotated[
+            str, Field(description="Time to convert in 24-hour format (HH:MM)")
+        ],
+        target_timezone: Annotated[
+            str,
+            Field(
+                description=f"Target IANA timezone name (e.g., 'Asia/Tokyo', 'America/San_Francisco'). Use '{local_tz}' as local timezone if no target timezone provided by the user."
+            ),
+        ],
+    ) -> TimeConversionResult:
+        require("source_timezone", source_timezone)
+        require("target_timezone", target_timezone)
+        return time_server.convert_time(source_timezone, time, target_timezone)
+
+    return server
+
+
+async def serve(local_timezone: str | None = None) -> None:
+    if local_timezone:
+        # Fail before the transport opens, with one line naming the bad value
+        # rather than a traceback. zoneinfo raises a different type per kind of
+        # bad key (unknown name, a tzdata directory, a path, a null byte), and
+        # its messages can carry a filesystem path, so none of them is shown.
         try:
-            match name:
-                case TimeTools.GET_CURRENT_TIME.value:
-                    timezone = arguments.get("timezone")
-                    if not timezone:
-                        raise ValueError("Missing required argument: timezone")
-
-                    result = time_server.get_current_time(timezone)
-
-                case TimeTools.CONVERT_TIME.value:
-                    if not all(
-                        k in arguments
-                        for k in ["source_timezone", "time", "target_timezone"]
-                    ):
-                        raise ValueError("Missing required arguments")
-
-                    result = time_server.convert_time(
-                        arguments["source_timezone"],
-                        arguments["time"],
-                        arguments["target_timezone"],
-                    )
-                case _:
-                    raise ValueError(f"Unknown tool: {name}")
-
-            return [
-                TextContent(type="text", text=json.dumps(result.model_dump(), indent=2))
-            ]
-
-        except Exception as e:
-            raise ValueError(f"Error processing mcp-server-time query: {str(e)}")
-
-    options = server.create_initialization_options()
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, options)
+            load_zoneinfo(local_timezone)
+        except (ZoneInfoNotFoundError, ValueError, OSError):
+            sys.exit(
+                f"Error: invalid --local-timezone {local_timezone!r}: "
+                "not a known IANA timezone name"
+            )
+    server = create_server(str(get_local_tz(local_timezone)))
+    # Both eras (#4853): the SDK's dual-era loop lets the client's first
+    # request decide. `initialize` gets the 2025-11-25 handshake;
+    # `server/discover` or a request carrying a 2026-07-28 envelope gets the
+    # modern, sessionless era, with its required result fields (resultType,
+    # ttlMs, cacheScope) filled in by the SDK.
+    await server.run_stdio_async()

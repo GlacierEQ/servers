@@ -11,26 +11,31 @@ Published on npm as [`@modelcontextprotocol/server-filesystem`](https://www.npmj
 - Move files/directories
 - Search files
 - Get file metadata
-- Dynamic directory access control via [Roots](https://modelcontextprotocol.io/docs/learn/client-concepts#roots)
+- Directory access control from command-line arguments, with [Roots](https://modelcontextprotocol.io/docs/learn/client-concepts#roots) as a deprecated, 2025-era convenience
+- Serves both protocol eras on stdio: 2026-07-28 clients (`server/discover`, no handshake) and 2025-era clients (`initialize`)
 
 ## Directory Access Control
 
-The server uses a flexible directory access control system. Directories can be specified via command-line arguments or dynamically via [Roots](https://modelcontextprotocol.io/docs/learn/client-concepts#roots).
+The server may touch only its **allowed directories**. Pass them on the command line. A 2025-era client that supports [Roots](https://modelcontextprotocol.io/docs/learn/client-concepts#roots) can also replace them at runtime, but Roots is [deprecated as of protocol version 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/deprecated) and a 2026-07-28 connection cannot use it.
 
-### Method 1: Command-line Arguments
+### Method 1: Command-line Arguments (Recommended)
 Specify Allowed directories when starting the server:
 ```bash
 mcp-server-filesystem /path/to/dir1 /path/to/dir2
 ```
 
-### Method 2: MCP Roots (Recommended)
-MCP clients that support [Roots](https://modelcontextprotocol.io/docs/learn/client-concepts#roots) can dynamically update the Allowed directories. 
+This is the only method that works on every protocol version, so it is the one to use.
+
+### Method 2: MCP Roots (Deprecated, 2025-era clients only)
+A client that connects with a 2025-era protocol version (the `initialize` handshake) and supports [Roots](https://modelcontextprotocol.io/docs/learn/client-concepts#roots) can dynamically update the Allowed directories.
 
 Roots notified by Client to Server, completely replace any server-side Allowed directories when provided.
 
-**Important**: If server starts without command-line arguments AND client doesn't support roots protocol (or provides empty roots), the server will throw an error during initialization.
+A Root reached through a symlink is allowed in both its advertised form and its resolved form, as a command-line directory is: a Root of `file:///tmp/project` on macOS allows `/tmp/project` and `/private/tmp/project`. Every requested path is still resolved and checked against the resolved directories, so a symlink inside a Root that points outside it is refused.
 
-This is the recommended method, as this enables runtime directory updates via `roots/list_changed` notifications without server restart, providing a more flexible and modern integration experience.
+**Important**: If server starts without command-line arguments AND a 2025-era client doesn't support roots protocol, the server fails at initialization: it logs the reason to stderr, closes the connection and exits with status 1. A client that supports roots but provides none (or none that are valid) keeps the connection, with no allowed directories until it sends `roots/list_changed` with valid roots.
+
+The 2026-07-28 protocol has no `initialize` handshake and no server-to-client `roots/list` request, so a 2026-07-28 client's roots are never asked for: the command-line directories are the whole allow-list. A server started with none answers every tool call on such a connection with an error saying so.
 
 ### How It Works
 
@@ -40,27 +45,32 @@ The server's directory access control follows this flow:
    - Server starts with directories from command-line arguments (if provided)
    - If no arguments provided, server starts with empty allowed directories
 
-2. **Client Connection & Initialization**
-   - Client connects and sends `initialize` request with capabilities
-   - Server checks if client supports roots protocol (`capabilities.roots`)
+2. **Client Connection**
+   - The client's first message picks the protocol era of the connection
+   - A **2026-07-28** client sends `server/discover` (or any request carrying the per-request `_meta` envelope): the server uses the command-line directories, and steps 3 and 4 do not apply
+   - A **2025-era** client sends `initialize` with its capabilities, and the server checks whether it supports roots (`capabilities.roots`)
    
-3. **Roots Protocol Handling** (if client supports roots)
+3. **Roots Protocol Handling** (2025-era clients that support roots)
    - **On initialization**: Server requests roots from client via `roots/list`
    - Client responds with its configured roots
    - Server replaces ALL allowed directories with client's roots
+   - Tool calls that arrive before the initial roots are loaded wait for them, so they are checked against the client's roots
    - **On runtime updates**: Client can send `notifications/roots/list_changed`
    - Server requests updated roots and replaces allowed directories again
+   - Tool calls that arrive while an update is being fetched wait for it, so none runs against a root the client has just withdrawn
+   - Once the client's roots are in force, an update with no valid roots revokes access: every path is refused ("Access denied - no allowed directories") until the client exposes a root again. Before any root has been in force, such an update keeps the command-line directories
 
-4. **Fallback Behavior** (if client doesn't support roots)
+4. **Fallback Behavior** (2025-era clients that don't support roots)
    - Server continues using command-line directories only
    - No dynamic updates possible
+   - With no command-line directories either, the server logs an error, closes the connection and exits with status 1
 
 5. **Access Control**
    - All filesystem operations are restricted to allowed directories
    - Use `list_allowed_directories` tool to see current directories
    - Server requires at least ONE allowed directory to operate
 
-**Note**: The server will only allow operations within directories specified either via `args` or via Roots.
+**Note**: The server will only allow operations within directories specified either via `args` or, for a 2025-era client, via Roots.
 
 
 
@@ -95,6 +105,18 @@ The server's directory access control follows this flow:
   - Inputs:
     - `path` (string): File location
     - `content` (string): File content
+  - An existing file is overwritten in place, so it keeps its inode, creation
+    time, hard links and permissions (`edit_file` writes the same way). The
+    overwrite is not crash-atomic: a crash mid-write can leave the file partly
+    written. A read-only file is refused rather than replaced
+  - Allowed-directory checks are path-based: they check the name you pass,
+    not every name the file has. A hard link is a real name of the same file,
+    so when a file inside an allowed directory is also hard-linked from
+    somewhere else (pnpm, for example, hard-links package files into
+    `node_modules` from its store), overwriting or editing it changes the
+    content at every name, inside the allowed directories or not.
+    `get_file_info` reports a file's `hardLinks` count; more than 1 means
+    the file has other names
 
 - **edit_file**
   - Make selective edits using advanced pattern matching and formatting
@@ -102,7 +124,8 @@ The server's directory access control follows this flow:
     - Line-based and multi-line content matching
     - Whitespace normalization with indentation preservation
     - Multiple simultaneous edits with correct positioning
-    - Indentation style detection and preservation
+    - Indentation style detection and preservation: when only whitespace differs, each replacement line takes the indentation of the line it replaces
+    - Preserves the file's line endings (LF or CRLF)
     - Git-style diff output with context
     - Preview changes with dry run mode
   - Inputs:
@@ -138,15 +161,24 @@ The server's directory access control follows this flow:
     - `source` (string)
     - `destination` (string)
   - Fails if destination exists
+  - Across filesystems (the source and destination on different mounts or
+    disks), a regular file is moved by copying it to a newly created
+    destination, with its permissions and modification time, and then removing
+    the source. If the copy fails, the partial destination is removed and the
+    source is left in place. A directory cannot be moved across filesystems
+    and fails with an error; move its files one at a time instead
 
 - **search_files**
   - Recursively search for files/directories that match or do not match patterns
   - Inputs:
     - `path` (string): Starting directory
     - `pattern` (string): Search pattern
-    - `excludePatterns` (string[]): Exclude any patterns.
+    - `excludePatterns` (string[]): Exclude any patterns. An excluded entry is
+      skipped before it is resolved or read, so excluding a slow folder keeps
+      the search out of it entirely.
   - Glob-style pattern matching
   - Returns full paths to matches
+  - Bounded: see [Slow and very large trees](#slow-and-very-large-trees)
 
 - **directory_tree**
   - Get recursive JSON tree structure of directory contents
@@ -161,6 +193,7 @@ The server's directory access control follows this flow:
         - Empty array for empty directories
         - Omitted for files
   - Output is formatted with 2-space indentation for readability
+  - Bounded: see [Slow and very large trees](#slow-and-very-large-trees)
     
 - **get_file_info**
   - Get detailed file/directory metadata
@@ -172,12 +205,36 @@ The server's directory access control follows this flow:
     - Access time
     - Type (file/directory)
     - Permissions
+    - Hard-link count (`hardLinks`): the number of names the file has. More
+      than 1 means a write through this name changes the file at its other
+      names too (see `write_file`)
 
 - **list_allowed_directories**
   - List all directories the server is allowed to access
   - No input required
   - Returns:
-    - Directories that this server can read/write from
+    - Directories that this server can read/write from. A directory reached through a symlink is listed twice, in the form it was given and in its resolved form
+
+### Slow and very large trees
+
+A folder backed by a cloud-storage provider (macOS `~/Library/CloudStorage`,
+iCloud Drive) or a slow network mount can make a single filesystem call block
+for minutes while the provider fetches metadata. Two fixed limits keep one
+request from stalling the server:
+
+- **Resolving a path (in any tool), and each directory read in `search_files`
+  and `directory_tree`, waits at most 15 seconds.** A call that takes longer ends
+  the request with an error naming the path (`Filesystem call timed out after
+  15000 ms: ...`). A path whose real location cannot be read in time is
+  refused, never admitted.
+- **`search_files` and `directory_tree` visit at most 100,000 entries.** A walk
+  that reaches the cap ends with an error (`... stopped after visiting 100000
+  entries ...`) rather than a partial result. Excluded entries do not count.
+
+Either error means: narrow `path`, or name the slow or large folder in
+`excludePatterns`. A timed-out call cannot be cancelled and finishes in the
+background, so a provider that stalls repeatedly can still slow the server's
+other file operations until it answers.
 
 ### Tool annotations (MCP hints)
 
@@ -208,6 +265,10 @@ The mapping for filesystem tools is:
 | `move_file`                 | `false`      | `false`        | `true`          | Deletes source file                             |
 
 > Note: `idempotentHint` and `destructiveHint` are meaningful only when `readOnlyHint` is `false`, as defined by the MCP spec. Every tool also sets `openWorldHint: false` — this server only accesses the local filesystem within its allowed directories, never an open or external world.
+
+## Requirements
+
+Node.js 24 or later, when the server runs through `npx` or from source.
 
 ## Usage with Claude Desktop
 Add this to your `claude_desktop_config.json`:
