@@ -1,4 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/server";
 
 /**
  * Register a simple prompt with no arguments
@@ -24,6 +24,6 @@ export const registerSimplePrompt = (server: McpServer) => {
           },
         },
       ],
-    })
+    }),
   );
 };

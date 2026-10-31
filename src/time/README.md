@@ -6,6 +6,8 @@ A Model Context Protocol server that provides time and timezone conversion capab
 
 Source: https://github.com/modelcontextprotocol/servers/tree/main/src/time
 
+Requires MCP Python SDK 2.x (`mcp>=2.3,<3`).
+
 ### Available Tools
 
 - `get_current_time` - Get current time in a specific timezone or system timezone.
@@ -17,6 +19,20 @@ Source: https://github.com/modelcontextprotocol/servers/tree/main/src/time
     - `source_timezone` (string): Source IANA timezone name
     - `time` (string): Time in 24-hour format (HH:MM)
     - `target_timezone` (string): Target IANA timezone name
+
+A timezone name, here and in `--local-timezone`, must be an exact IANA key, case included: `Europe/Warsaw` is accepted and `europe/warsaw` is rejected on every platform, including macOS, whose case-insensitive filesystem would otherwise resolve it.
+
+### Protocol versions
+
+The server speaks both eras of the Model Context Protocol over stdio, with nothing to configure: a **2026-07-28** client (discovered with `server/discover`, no session) and a **2025-11-25** client (the `initialize` handshake). The client's first request decides which. Tools behave the same in both. Methods the 2026-07-28 specification removes, such as `ping`, are answered only on a 2025-11-25 connection.
+
+### Results and errors
+
+The server is built on the SDK's high-level `MCPServer`. Each tool declares an `outputSchema` and returns its result twice: as `structuredContent`, and as the same object in indented JSON in a text block, for a client that does not read structured output.
+
+- **A tool failure is an `isError` result** whose text the model can read and act on, prefixed `Error executing tool <name>: `. That covers an unknown or non-exact timezone (`Invalid timezone: ...`), an empty timezone (`Missing required argument: <argument>`), a time not in `HH:MM` 24-hour form, a wall-clock time skipped by a clock change, and an argument missing or of the wrong type (the SDK's validation message).
+- **An unknown tool name is a JSON-RPC `-32602` error** (`Unknown tool: <name>`), not an `isError` result, as both protocol versions specify.
+- The server registers no prompts or resources. Their list methods answer with empty lists.
 
 ## Installation
 
@@ -202,6 +218,8 @@ Example:
 }
 ```
 
+The Docker image cannot see the host's timezone, so it reads the `LOCAL_TIMEZONE` environment variable when the container starts, and uses `UTC` when it is unset or empty. Pass it with `-e`: `"-e", "LOCAL_TIMEZONE"` forwards the client's own value, as in the Docker configuration above, and `"-e", "LOCAL_TIMEZONE=America/New_York"` sets one. A `--local-timezone` given after the image name takes precedence.
+
 ## Example Interactions
 
 1. Get current time:
@@ -213,11 +231,12 @@ Example:
   }
 }
 ```
-Response:
+Response (`structuredContent`, and the same JSON as text):
 ```json
 {
   "timezone": "Europe/Warsaw",
   "datetime": "2024-01-01T13:00:00+01:00",
+  "day_of_week": "Monday",
   "is_dst": false
 }
 ```
@@ -233,20 +252,22 @@ Response:
   }
 }
 ```
-Response:
+Response (`structuredContent`, and the same JSON as text):
 ```json
 {
   "source": {
     "timezone": "America/New_York",
-    "datetime": "2024-01-01T12:30:00-05:00",
+    "datetime": "2024-01-01T16:30:00-05:00",
+    "day_of_week": "Monday",
     "is_dst": false
   },
   "target": {
     "timezone": "Asia/Tokyo",
-    "datetime": "2024-01-01T12:30:00+09:00",
+    "datetime": "2024-01-02T06:30:00+09:00",
+    "day_of_week": "Tuesday",
     "is_dst": false
   },
-  "time_difference": "+13.0h",
+  "time_difference": "+14.0h"
 }
 ```
 
@@ -272,6 +293,32 @@ npx @modelcontextprotocol/inspector uv run mcp-server-time
 3. "When it's 4 PM in New York, what time is it in London?"
 4. "Convert 9:30 AM Tokyo time to New York time"
 
+## Development
+
+Run the tests from `src/time`. They live in `tests/`: `test_protocol.py` drives
+the server through an MCP `ClientSession` in-process, `test_eras.py` runs a
+`Client` against it as a 2026-07-28 and as a 2025-11-25 client, `test_entrypoints.py`
+covers `main()`, `python -m mcp_server_time` and the console script, and
+`test_server.py` unit-tests the time helpers.
+
+```bash
+cd src/time
+uv run pytest
+```
+
+Coverage is a separate command. It measures line and branch coverage of
+`src/mcp_server_time`, prints the missing lines, and writes `coverage.json`
+(ignored by git):
+
+```bash
+cd src/time
+uv run --frozen pytest --cov --cov-report=term-missing --cov-report=json
+```
+
+Every file must reach 90% of its lines and 90% of its branches. Code that
+cannot be reached is marked `# pragma: no cover  # <reason>`, always with the
+reason, rather than lowering the bar.
+
 ## Build
 
 Docker build:
@@ -283,12 +330,12 @@ docker build -t mcp/time .
 
 ## Contributing
 
-We encourage contributions to help expand and improve mcp-server-time. Whether you want to add new time-related tools, enhance existing functionality, or improve documentation, your input is valuable.
+We encourage contributions to help improve mcp-server-time. Bug reports, ideas for new time-related tools, enhancements to existing functionality, and documentation improvements are all valuable.
 
 For examples of other MCP servers and implementation patterns, see:
 https://github.com/modelcontextprotocol/servers
 
-Pull requests are welcome! Feel free to contribute new ideas, bug fixes, or enhancements to make mcp-server-time even more powerful and useful.
+Contributions arrive as **issues, not pull requests**: the repository maintainers do the implementation. Open an issue with the [bug report or feature request form](https://github.com/modelcontextprotocol/servers/issues/new/choose), and if you have already prototyped a change, share the prompt you used rather than a diff. See [CONTRIBUTING.md](https://github.com/modelcontextprotocol/servers/blob/main/CONTRIBUTING.md) for the full policy.
 
 ## License
 

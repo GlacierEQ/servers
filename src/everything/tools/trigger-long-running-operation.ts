@@ -1,6 +1,5 @@
 import { z } from "zod";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { McpServer, CallToolResult } from "@modelcontextprotocol/server";
 
 // Tool input schema
 const TriggerLongRunningOperationSchema = z.object({
@@ -26,7 +25,7 @@ const config = {
 };
 
 /**
- * Registers the 'trigger-tong-running-operation' tool.
+ * Registers the 'trigger-long-running-operation' tool.
  *
  * The registered tool starts a long-running operation defined by a specific duration and
  * number of steps.
@@ -43,15 +42,15 @@ export const registerTriggerLongRunningOperationTool = (server: McpServer) => {
   server.registerTool(
     name,
     config,
-    async (args, extra): Promise<CallToolResult> => {
+    async (args, ctx): Promise<CallToolResult> => {
       const validatedArgs = TriggerLongRunningOperationSchema.parse(args);
       const { duration, steps } = validatedArgs;
       const stepDuration = duration / steps;
-      const progressToken = extra._meta?.progressToken;
+      const progressToken = ctx.mcpReq._meta?.progressToken;
 
       for (let i = 1; i < steps + 1; i++) {
         await new Promise((resolve) =>
-          setTimeout(resolve, stepDuration * 1000)
+          setTimeout(resolve, stepDuration * 1000),
         );
 
         if (progressToken !== undefined) {
@@ -64,7 +63,7 @@ export const registerTriggerLongRunningOperationTool = (server: McpServer) => {
                 progressToken,
               },
             },
-            { relatedRequestId: extra.requestId }
+            { relatedRequestId: ctx.mcpReq.id },
           );
         }
       }
@@ -77,6 +76,6 @@ export const registerTriggerLongRunningOperationTool = (server: McpServer) => {
           },
         ],
       };
-    }
+    },
   );
 };

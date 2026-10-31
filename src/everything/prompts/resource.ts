@@ -1,4 +1,5 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/server";
+import { z } from "zod";
 import {
   resourceTypeCompleter,
   resourceIdForPromptCompleter,
@@ -22,10 +23,10 @@ import {
  */
 export const registerEmbeddedResourcePrompt = (server: McpServer) => {
   // Prompt arguments
-  const promptArgsSchema = {
+  const promptArgsSchema = z.object({
     resourceType: resourceTypeCompleter,
     resourceId: resourceIdForPromptCompleter,
-  };
+  });
 
   // Register the prompt
   server.registerPrompt(
@@ -40,11 +41,11 @@ export const registerEmbeddedResourcePrompt = (server: McpServer) => {
       const resourceType = args.resourceType;
       if (
         !RESOURCE_TYPES.includes(
-          resourceType as typeof RESOURCE_TYPE_TEXT | typeof RESOURCE_TYPE_BLOB
+          resourceType as typeof RESOURCE_TYPE_TEXT | typeof RESOURCE_TYPE_BLOB,
         )
       ) {
         throw new Error(
-          `Invalid resourceType: ${args?.resourceType}. Must be ${RESOURCE_TYPE_TEXT} or ${RESOURCE_TYPE_BLOB}.`
+          `Invalid resourceType: ${args?.resourceType}. Must be ${RESOURCE_TYPE_TEXT} or ${RESOURCE_TYPE_BLOB}.`,
         );
       }
 
@@ -56,7 +57,7 @@ export const registerEmbeddedResourcePrompt = (server: McpServer) => {
         resourceId < 1
       ) {
         throw new Error(
-          `Invalid resourceId: ${args?.resourceId}. Must be a finite positive integer.`
+          `Invalid resourceId: ${args?.resourceId}. Must be a finite positive integer.`,
         );
       }
 
@@ -88,6 +89,6 @@ export const registerEmbeddedResourcePrompt = (server: McpServer) => {
           },
         ],
       };
-    }
+    },
   );
 };

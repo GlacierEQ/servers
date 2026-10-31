@@ -1,7 +1,13 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, type CacheHint } from "@modelcontextprotocol/server";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import { readdirSync, readFileSync, statSync } from "fs";
+
+/** How long a client or shared cache may keep a static document. */
+export const STATIC_DOCUMENT_CACHE_HINT: CacheHint = {
+  ttlMs: 60 * 60_000,
+  cacheScope: "public",
+};
 
 /**
  * Register static file resources
@@ -18,10 +24,10 @@ export const registerFileResources = (server: McpServer) => {
   const __filename = fileURLToPath(import.meta.url);
   const __dirname = dirname(__filename);
   const docsDir = join(__dirname, "..", "docs");
-  let entries: string[] = [];
+  let entries: string[];
   try {
     entries = readdirSync(docsDir);
-  } catch (e) {
+  } catch {
     // If docs/ folder is missing or unreadable, just skip registration
     return;
   }
@@ -46,7 +52,9 @@ export const registerFileResources = (server: McpServer) => {
     server.registerResource(
       name,
       uri,
-      { mimeType, description },
+      // A static document changes only when the server is upgraded, so any
+      // cache may keep it for an hour (2026-07-28 clients only; #4852).
+      { mimeType, description, cacheHint: STATIC_DOCUMENT_CACHE_HINT },
       async (uri) => {
         const text = readFileSafe(fullPath);
         return {
@@ -58,7 +66,7 @@ export const registerFileResources = (server: McpServer) => {
             },
           ],
         };
-      }
+      },
     );
   }
 };
