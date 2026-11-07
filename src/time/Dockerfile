@@ -11,9 +11,8 @@ ENV UV_COMPILE_BYTECODE=1
 ENV UV_LINK_MODE=copy
 
 # Install the project's dependencies using the lockfile and settings
+COPY uv.lock pyproject.toml ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=uv.lock,target=uv.lock \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     uv sync --locked --no-install-project --no-dev --no-editable
 
 # Then, add the rest of the project source code and install it
@@ -27,13 +26,20 @@ FROM python:3.12-slim-bookworm
 WORKDIR /app
  
 COPY --from=uv /root/.local /root/.local
+
+RUN if ! id -u app >/dev/null 2>&1; then \
+      useradd -rUM -s /usr/sbin/nologin app; \
+    fi
 COPY --from=uv --chown=app:app /app/.venv /app/.venv
 
 # Place executables in the environment at the front of the path
 ENV PATH="/app/.venv/bin:$PATH"
 
-# Set the LOCAL_TIMEZONE environment variable
-ENV LOCAL_TIMEZONE=${LOCAL_TIMEZONE:-"UTC"}
+# The local timezone, overridable at run time with `docker run -e LOCAL_TIMEZONE=…`
+ENV LOCAL_TIMEZONE=UTC
 
-# when running the container, add --local-timezone and a bind mount to the host's db file
-ENTRYPOINT ["mcp-server-time", "--local-timezone", "${LOCAL_TIMEZONE}"]
+# Docker expands no variables in an exec-form ENTRYPOINT, so a shell reads
+# LOCAL_TIMEZONE when the container starts (UTC when it is set but empty).
+# `exec` keeps the server as PID 1, so it receives stop signals, and "$@"
+# passes any arguments given after the image name on to the server.
+ENTRYPOINT ["sh", "-c", "exec mcp-server-time --local-timezone \"${LOCAL_TIMEZONE:-UTC}\" \"$@\"", "--"]
