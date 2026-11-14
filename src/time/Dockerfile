@@ -10,10 +10,14 @@ ENV UV_COMPILE_BYTECODE=1
 # Copy from the cache instead of linking since it's a mounted volume
 ENV UV_LINK_MODE=copy
 
+# Install the Python that .python-version pins under /python rather than the
+# default /root/.local, which the unprivileged runtime user cannot read (/root
+# is mode 700). The virtualenv's interpreter links into this directory.
+ENV UV_PYTHON_INSTALL_DIR=/python
+
 # Install the project's dependencies using the lockfile and settings
+COPY uv.lock pyproject.toml ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=uv.lock,target=uv.lock \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     uv sync --locked --no-install-project --no-dev --no-editable
 
 # Then, add the rest of the project source code and install it
@@ -26,14 +30,27 @@ FROM python:3.12-slim-bookworm
 
 WORKDIR /app
  
-COPY --from=uv /root/.local /root/.local
+COPY --from=uv /python /python
+
+# The server runs as the unprivileged `app` user, not root (#4741), so files it
+# writes into a bind mount are not root-owned on the host and the image passes
+# `runAsNonRoot` admission policies. The user gets a home directory, where
+# HOME points, for any per-user configuration a tool reads, and a fixed UID:
+# USER names it by number, since Kubernetes cannot verify that a named user is
+# not root and refuses to start the container under `runAsNonRoot`.
+RUN useradd -rUm -u 999 -d /home/app -s /usr/sbin/nologin app
 COPY --from=uv --chown=app:app /app/.venv /app/.venv
+
+USER 999:999
 
 # Place executables in the environment at the front of the path
 ENV PATH="/app/.venv/bin:$PATH"
 
-# Set the LOCAL_TIMEZONE environment variable
-ENV LOCAL_TIMEZONE=${LOCAL_TIMEZONE:-"UTC"}
+# The local timezone, overridable at run time with `docker run -e LOCAL_TIMEZONE=…`
+ENV LOCAL_TIMEZONE=UTC
 
-# when running the container, add --local-timezone and a bind mount to the host's db file
-ENTRYPOINT ["mcp-server-time", "--local-timezone", "${LOCAL_TIMEZONE}"]
+# Docker expands no variables in an exec-form ENTRYPOINT, so a shell reads
+# LOCAL_TIMEZONE when the container starts (UTC when it is set but empty).
+# `exec` keeps the server as PID 1, so it receives stop signals, and "$@"
+# passes any arguments given after the image name on to the server.
+ENTRYPOINT ["sh", "-c", "exec mcp-server-time --local-timezone \"${LOCAL_TIMEZONE:-UTC}\" \"$@\"", "--"]

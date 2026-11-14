@@ -1,6 +1,5 @@
 import { z } from "zod";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { McpServer, CallToolResult } from "@modelcontextprotocol/server";
 import {
   textResource,
   textResourceUri,
@@ -10,16 +9,18 @@ import {
   RESOURCE_TYPE_TEXT,
   RESOURCE_TYPES,
 } from "../resources/templates.js";
+import { TOOL_ICONS } from "../server/icons.js";
 
 // Tool input schema
 const GetResourceReferenceSchema = z.object({
   resourceType: z
     .enum([RESOURCE_TYPE_TEXT, RESOURCE_TYPE_BLOB])
-    .default(RESOURCE_TYPE_TEXT),
+    .default(RESOURCE_TYPE_TEXT)
+    .describe("Whether to reference a text resource or a blob resource"),
   resourceId: z
     .number()
     .default(1)
-    .describe("ID of the text resource to fetch"),
+    .describe("ID of the text or blob resource to fetch, a positive integer"),
 });
 
 // Tool configuration
@@ -28,6 +29,7 @@ const config = {
   title: "Get Resource Reference Tool",
   description: "Returns a resource reference that can be used by MCP clients",
   inputSchema: GetResourceReferenceSchema,
+  icons: TOOL_ICONS,
   annotations: {
     readOnlyHint: true,
     destructiveHint: false,
@@ -56,9 +58,10 @@ export const registerGetResourceReferenceTool = (server: McpServer) => {
   server.registerTool(name, config, async (args): Promise<CallToolResult> => {
     // Validate resource type argument
     const { resourceType } = args;
+    /* v8 ignore next -- unreachable: the input schema's enum rejects any other resourceType before the handler runs */
     if (!RESOURCE_TYPES.includes(resourceType)) {
       throw new Error(
-        `Invalid resourceType: ${args?.resourceType}. Must be ${RESOURCE_TYPE_TEXT} or ${RESOURCE_TYPE_BLOB}.`
+        `Invalid resourceType: ${args?.resourceType}. Must be ${RESOURCE_TYPE_TEXT} or ${RESOURCE_TYPE_BLOB}.`,
       );
     }
 
@@ -70,7 +73,7 @@ export const registerGetResourceReferenceTool = (server: McpServer) => {
       resourceId < 1
     ) {
       throw new Error(
-        `Invalid resourceId: ${args?.resourceId}. Must be a finite positive integer.`
+        `Invalid resourceId: ${args?.resourceId}. Must be a finite positive integer.`,
       );
     }
 

@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { McpServer, CallToolResult } from "@modelcontextprotocol/server";
+import { TOOL_ICONS } from "../server/icons.js";
 
 // Tool input schema
 const GetSumSchema = z.object({
@@ -14,6 +14,7 @@ const config = {
   title: "Get Sum Tool",
   description: "Returns the sum of two numbers",
   inputSchema: GetSumSchema,
+  icons: TOOL_ICONS,
   annotations: {
     readOnlyHint: true,
     destructiveHint: false,
