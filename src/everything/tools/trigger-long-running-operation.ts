@@ -1,6 +1,7 @@
+import { setTimeout as sleep } from "node:timers/promises";
 import { z } from "zod";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { McpServer, CallToolResult } from "@modelcontextprotocol/server";
+import { TOOL_ICONS } from "../server/icons.js";
 
 // Tool input schema
 const TriggerLongRunningOperationSchema = z.object({
@@ -17,6 +18,7 @@ const config = {
   title: "Trigger Long Running Operation Tool",
   description: "Demonstrates a long running operation with progress updates.",
   inputSchema: TriggerLongRunningOperationSchema,
+  icons: TOOL_ICONS,
   annotations: {
     readOnlyHint: true,
     destructiveHint: false,
@@ -26,7 +28,7 @@ const config = {
 };
 
 /**
- * Registers the 'trigger-tong-running-operation' tool.
+ * Registers the 'trigger-long-running-operation' tool.
  *
  * The registered tool starts a long-running operation defined by a specific duration and
  * number of steps.
@@ -37,22 +39,40 @@ const config = {
  * At the end of the operation, the tool returns a message indicating the completion of the
  * operation, including the total duration and steps.
  *
+ * The operation watches the request's abort signal, which the SDK fires when the client
+ * sends `notifications/cancelled` or the connection closes, in either protocol era. On
+ * cancellation it clears its pending timer and stops without sending further progress, so
+ * a cancelled operation never holds the process open (#1124, #4846).
+ *
  * @param {McpServer} server - The McpServer instance where the tool will be registered.
  */
 export const registerTriggerLongRunningOperationTool = (server: McpServer) => {
   server.registerTool(
     name,
     config,
-    async (args, extra): Promise<CallToolResult> => {
+    async (args, ctx): Promise<CallToolResult> => {
       const validatedArgs = TriggerLongRunningOperationSchema.parse(args);
       const { duration, steps } = validatedArgs;
       const stepDuration = duration / steps;
-      const progressToken = extra._meta?.progressToken;
+      const progressToken = ctx.mcpReq._meta?.progressToken;
+      const signal = ctx.mcpReq.signal;
 
       for (let i = 1; i < steps + 1; i++) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, stepDuration * 1000)
-        );
+        try {
+          // Rejects at once, clearing its timer, when the request is cancelled.
+          await sleep(stepDuration * 1000, undefined, { signal });
+        } catch {
+          // The SDK drops the response to a cancelled request, so this result
+          // never reaches the client; returning simply ends the handler.
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Long running operation cancelled after ${i - 1} of ${steps} steps.`,
+              },
+            ],
+          };
+        }
 
         if (progressToken !== undefined) {
           await server.server.notification(
@@ -64,7 +84,7 @@ export const registerTriggerLongRunningOperationTool = (server: McpServer) => {
                 progressToken,
               },
             },
-            { relatedRequestId: extra.requestId }
+            { relatedRequestId: ctx.mcpReq.id },
           );
         }
       }
@@ -77,6 +97,6 @@ export const registerTriggerLongRunningOperationTool = (server: McpServer) => {
           },
         ],
       };
-    }
+    },
   );
 };
