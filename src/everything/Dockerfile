@@ -1,22 +1,73 @@
-FROM node:22.12-alpine AS builder
+# The `everything` server's container image (#3309). Build it from the
+# repository root, which is the build context:
+#
+#   docker build -f src/everything/Dockerfile -t mcp/everything .
+#
+# `everything` is an npm workspace, so its lockfile and the `overrides` that pin
+# its transitive dependencies live in the root package.json and
+# package-lock.json, not in src/everything. Both stages install from them with
+# `npm ci`, so the image gets exactly the versions this repository tested,
+# rather than whatever a lockfile-less `npm install` resolves on the day.
+# Dockerfile.dockerignore (next to this file) keeps the context to what the
+# build reads.
+#
+# The image runs the server over stdio by default (`docker run -i`); give the
+# transport name as the argument to run another, e.g. `streamableHttp`, which
+# listens on PORT (3001) on every interface (HOST=0.0.0.0) so a published
+# port reaches it.
+# The README's "Running with Docker" section has both commands. This repository
+# publishes no image: `mcp/everything` on Docker Hub is built by Docker.
 
-COPY src/everything /app
-COPY tsconfig.json /tsconfig.json
+FROM node:24-alpine AS builder
 
-WORKDIR /app
+WORKDIR /repo
 
-RUN --mount=type=cache,target=/root/.npm npm install
+# Manifests first, so the dependency layer is reused until one of them changes.
+COPY package.json package-lock.json .npmrc tsconfig.json ./
+COPY src/everything/package.json src/everything/
 
-FROM node:22-alpine AS release
+# `--ignore-scripts` skips the workspace's `prepare` build, which needs the
+# source; the build runs explicitly below.
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --workspace src/everything --ignore-scripts
 
-WORKDIR /app
+COPY src/everything src/everything
+RUN npm run build --workspace src/everything
 
-COPY --from=builder /app/dist /app/dist
-COPY --from=builder /app/package.json /app/package.json
-COPY --from=builder /app/package-lock.json /app/package-lock.json
+
+FROM node:24-alpine AS release
 
 ENV NODE_ENV=production
 
-RUN npm ci --ignore-scripts --omit-dev
+WORKDIR /repo
 
-CMD ["node", "dist/index.js"]
+COPY package.json package-lock.json .npmrc ./
+COPY src/everything/package.json src/everything/
+
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --workspace src/everything --omit=dev --ignore-scripts
+
+COPY --from=builder /repo/src/everything/dist src/everything/dist
+
+WORKDIR /repo/src/everything
+
+# The base image's unprivileged `node` user, named by number: Kubernetes cannot
+# verify that a named user is not root, and refuses to start the container
+# under `runAsNonRoot` (#4741).
+USER 1000:1000
+
+# The Streamable HTTP (and deprecated HTTP+SSE) transports' default port.
+ENV PORT=3001
+# Outside a container they bind loopback only (#5371); inside one, loopback is
+# the container's own, which a published port cannot reach, so the image
+# widens the bind to every interface. `-p 127.0.0.1:…` keeps it off the
+# host's network.
+ENV HOST=0.0.0.0
+EXPOSE 3001
+
+# Both transports close cleanly on SIGINT; node running as PID 1 would ignore
+# the default SIGTERM, leaving `docker stop` to wait out its timeout.
+STOPSIGNAL SIGINT
+
+ENTRYPOINT ["node", "dist/index.js"]
+CMD ["stdio"]

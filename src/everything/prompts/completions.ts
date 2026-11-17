@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { completable } from "@modelcontextprotocol/sdk/server/completable.js";
+import { McpServer, completable } from "@modelcontextprotocol/server";
+import { PROMPT_ICONS } from "../server/icons.js";
 
 /**
  * Register a prompt with completable arguments
@@ -12,14 +12,14 @@ import { completable } from "@modelcontextprotocol/sdk/server/completable.js";
  */
 export const registerPromptWithCompletions = (server: McpServer) => {
   // Prompt arguments
-  const promptArgsSchema = {
+  const promptArgsSchema = z.object({
     department: completable(
       z.string().describe("Choose the department."),
       (value) => {
         return ["Engineering", "Sales", "Marketing", "Support"].filter((d) =>
-          d.startsWith(value)
+          d.startsWith(value),
         );
-      }
+      },
     ),
     name: completable(
       z
@@ -37,15 +37,16 @@ export const registerPromptWithCompletions = (server: McpServer) => {
           return ["John", "Kim", "Lee"].filter((n) => n.startsWith(value));
         }
         return [];
-      }
+      },
     ),
-  };
+  });
 
   // Register the prompt
   server.registerPrompt(
     "completable-prompt",
     {
       title: "Team Management",
+      icons: PROMPT_ICONS,
       description: "First argument choice narrows values for second argument.",
       argsSchema: promptArgsSchema,
     },
@@ -59,6 +60,6 @@ export const registerPromptWithCompletions = (server: McpServer) => {
           },
         },
       ],
-    })
+    }),
   );
 };
